@@ -15,6 +15,10 @@ class LifecycleError(RuntimeError):
     """A requested lifecycle transition is invalid or cannot be reconciled."""
 
 
+class IndeterminateLifecycleError(LifecycleError):
+    """An external supervisor action may have changed the lab state."""
+
+
 @dataclass
 class RunLifecycle:
     state_dir: str
@@ -62,18 +66,26 @@ class RunLifecycle:
             raise LifecycleError("Lab credentials are expired or unavailable.")
         try:
             self.supervisor.start()
-            if self.supervisor.status() != "active":
-                raise LifecycleError("Lab service did not become active.")
+            status = self.supervisor.status()
         except SupervisorError as exc:
-            raise LifecycleError("Lab service outcome is unknown.") from exc
+            raise IndeterminateLifecycleError("Lab service outcome is unknown.") from exc
+        if status == "active":
+            return
+        if status in {"inactive", "failed"}:
+            raise LifecycleError("Lab service did not become active.")
+        raise IndeterminateLifecycleError("Lab service outcome is unknown.")
 
     def stop(self) -> None:
         try:
             self.supervisor.stop()
-            if self.supervisor.status() not in {"inactive", "failed"}:
-                raise LifecycleError("Lab service did not become inactive.")
+            status = self.supervisor.status()
         except SupervisorError as exc:
-            raise LifecycleError("Lab service outcome is unknown.") from exc
+            raise IndeterminateLifecycleError("Lab service outcome is unknown.") from exc
+        if status in {"inactive", "failed"}:
+            return
+        if status == "active":
+            raise LifecycleError("Lab service did not become inactive.")
+        raise IndeterminateLifecycleError("Lab service outcome is unknown.")
 
     def reset(self, scenario: str, ttl: int) -> int:
         if scenario not in SCENARIO_IDS or not 300 <= ttl <= 86400:

@@ -11,7 +11,7 @@ import stat
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 class ControlStoreError(RuntimeError):
@@ -131,14 +131,26 @@ class ControlStore:
             active = connection.execute(
                 "SELECT COUNT(*) FROM leases WHERE released_at IS NULL AND expires_at > ?", (_now(),)
             ).fetchone()[0]
+            expired_unreleased = connection.execute(
+                "SELECT COUNT(*) FROM leases WHERE released_at IS NULL AND expires_at <= ?", (_now(),)
+            ).fetchone()[0]
         return {
             "state_version": str(row["version"]), "lifecycle": row["lifecycle"], "initialized": row["lifecycle"] != "UNINITIALIZED",
             "validated": bool(row["validated"]), "token_expires_at": row["token_expires_at"],
-            "credential_generation": row["generation"], "evaluation_leases": {"active": active},
+            "credential_generation": row["generation"],
+            "evaluation_leases": {"active": active, "expired_unreleased": expired_unreleased},
             "credential_handoff": "BLOCKED",
         }
 
-    def begin_operation(self, actor: str, route: str, key: str | None, version: str | None, payload: dict[str, Any]) -> tuple[str, bool]:
+    def begin_operation(
+        self,
+        actor: str,
+        route: str,
+        key: str | None,
+        version: str | None,
+        payload: dict[str, Any],
+        guard: Callable[[sqlite3.Connection, sqlite3.Row], None] | None = None,
+    ) -> tuple[str, bool]:
         if not key or not 16 <= len(key) <= 128:
             raise PreconditionRequired("An Idempotency-Key of 16 to 128 characters is required.")
         if version is None:
@@ -150,7 +162,7 @@ class ControlStore:
                 if existing["request_hash"] != digest:
                     raise IdempotencyConflict("Idempotency key was used with a different request.")
                 return existing["operation_id"], True
-            state = connection.execute("SELECT version, lifecycle FROM state WHERE singleton = 1").fetchone()
+            state = connection.execute("SELECT * FROM state WHERE singleton = 1").fetchone()
             current = str(state["version"])
             if version != current:
                 raise StaleVersion("State version is stale.")
@@ -158,6 +170,8 @@ class ControlStore:
                 raise LeaseConflict("Lifecycle state requires operator reconciliation.")
             if connection.execute("SELECT 1 FROM operations WHERE state = 'RUNNING' LIMIT 1").fetchone():
                 raise LeaseConflict("Another lifecycle operation is active.")
+            if guard is not None:
+                guard(connection, state)
             operation_id = _id("op")
             now = _now()
             connection.execute("INSERT INTO operations VALUES (?, ?, ?, ?, 'RUNNING', NULL, ?, NULL)", (operation_id, actor, route, digest, now))
@@ -177,6 +191,16 @@ class ControlStore:
         with self.transaction() as connection:
             connection.execute("UPDATE operations SET state = 'FAILED', result_code = ?, completed_at = ? WHERE operation_id = ?", (code, _now(), operation_id))
 
+    def mark_operation_unknown(self, operation_id: str, code: str) -> None:
+        with self.transaction() as connection:
+            connection.execute("UPDATE operations SET state = 'UNKNOWN', result_code = ?, completed_at = ? WHERE operation_id = ?", (code, _now(), operation_id))
+            connection.execute("UPDATE state SET lifecycle = 'UNKNOWN', version = version + 1, updated_at = ? WHERE singleton = 1", (_now(),))
+
+    @staticmethod
+    def require_no_unreleased_leases(connection: sqlite3.Connection, _: sqlite3.Row) -> None:
+        if connection.execute("SELECT 1 FROM leases WHERE released_at IS NULL LIMIT 1").fetchone():
+            raise LeaseConflict("Unreleased evaluation leases block this operation.")
+
     def operation(self, operation_id: str) -> dict[str, Any] | None:
         with self.connection() as connection:
             row = connection.execute("SELECT operation_id, action, state, result_code, created_at, completed_at FROM operations WHERE operation_id = ?", (operation_id,)).fetchone()
@@ -184,7 +208,7 @@ class ControlStore:
 
     def active_leases(self) -> bool:
         with self.connection() as connection:
-            return bool(connection.execute("SELECT 1 FROM leases WHERE released_at IS NULL AND expires_at > ?", (_now(),)).fetchone())
+            return bool(connection.execute("SELECT 1 FROM leases WHERE released_at IS NULL LIMIT 1").fetchone())
 
     def acquire_lease(self, actor: str, duration: int) -> dict[str, Any]:
         if not 60 <= duration <= 3600:
@@ -193,6 +217,8 @@ class ControlStore:
             state = connection.execute("SELECT lifecycle, generation FROM state WHERE singleton = 1").fetchone()
             if state["lifecycle"] != "RUNNING":
                 raise LeaseConflict("Evaluation requires a running lab.")
+            if connection.execute("SELECT 1 FROM operations WHERE state = 'RUNNING' LIMIT 1").fetchone():
+                raise LeaseConflict("Lifecycle transition is in progress.")
             lease_id, expires_at = _id("lease"), _now() + duration
             connection.execute("INSERT INTO leases VALUES (?, ?, ?, ?, NULL, ?)", (lease_id, actor, state["generation"], expires_at, _now()))
         return {"lease_id": lease_id, "generation": state["generation"], "expires_at": expires_at}

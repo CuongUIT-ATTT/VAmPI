@@ -55,9 +55,9 @@ Control journal dùng `control.sqlite3` trong `BOLA_MGMT_STATE_DIR` mode `0700`/
 - `init` chỉ khi private state chưa tồn tại và service pinned đang inactive/failed.
 - `validate` yêu cầu service stopped; thành công tạo `STOPPED` + `validated=true`.
 - `start` yêu cầu state validated và token chưa hết hạn; supervisor phải xác nhận `active`.
-- `stop` và `reset` bị chặn khi có evaluation lease active.
+- `stop` và `reset` bị chặn khi có **bất kỳ lease chưa release** nào, kể cả lease đã hết hạn; hết hạn không chứng minh evaluation đã dừng. Evaluator phải release tường minh sau khi hoàn tất, hoặc operator phải reconcile ngoài băng trước khi thay đổi lifecycle.
 - `reset` chỉ ở `STOPPED`, cần `confirm_invalidate_tokens=true`; token/marker cũ bị rotate và generation tăng.
-- Timeout/supervisor error hoặc operation interrupted không được coi là success/failure chắc chắn; state `UNKNOWN` yêu cầu reconcile operator.
+- Timeout/supervisor error, final supervisor state `activating`/`deactivating`/`unknown`, hoặc operation interrupted không được coi là success/failure chắc chắn; state `UNKNOWN` yêu cầu reconcile operator.
 
 Mọi lifecycle mutation cần hai header:
 

@@ -8,7 +8,7 @@ from typing import Any
 from flask import Flask, Response, g, request
 
 from .control.identity import IdentityError, IdentityProvider, ManagementIdentity, MTLSIdentityProvider
-from .control.lifecycle import LifecycleError, RunLifecycle
+from .control.lifecycle import IndeterminateLifecycleError, LifecycleError, RunLifecycle
 from .control.store import (
     ControlStore,
     ControlStoreError,
@@ -71,9 +71,16 @@ def create_management_app(*, store: ControlStore, lifecycle: RunLifecycle, ident
             return _error("forbidden", "Management role is not permitted for this operation.", 403)
         return None
 
-    def mutating(route: str, body: dict[str, Any]) -> tuple[str, Response | None]:
+    def mutating(route: str, body: dict[str, Any], guard: Any = None) -> tuple[str, Response | None]:
         try:
-            operation_id, replay = store.begin_operation(identity().subject, route, request.headers.get("Idempotency-Key"), request.headers.get("If-Match"), body)
+            operation_id, replay = store.begin_operation(
+                identity().subject,
+                route,
+                request.headers.get("Idempotency-Key"),
+                request.headers.get("If-Match"),
+                body,
+                guard,
+            )
         except PreconditionRequired as exc:
             return "", _error("precondition_required", str(exc), 428)
         except StaleVersion as exc:
@@ -88,6 +95,8 @@ def create_management_app(*, store: ControlStore, lifecycle: RunLifecycle, ident
         try:
             result = callback()
             store.finish_operation(operation_id, "ok", **(success(result) if callable(success) else success))
+        except IndeterminateLifecycleError:
+            store.mark_operation_unknown(operation_id, "transition_indeterminate")
         except LifecycleError:
             store.fail_operation(operation_id, "transition_rejected")
         return _response({"operation_id": operation_id}, 202, {"Location": f"/management/v1/operations/{operation_id}"})
@@ -150,12 +159,14 @@ def create_management_app(*, store: ControlStore, lifecycle: RunLifecycle, ident
             body = _payload(set())
         except ValueError as exc:
             return _error("invalid_request", str(exc), 422)
-        current = store.status()
-        if not current["validated"]:
-            return _error("state_conflict", "Lab state must be validated before start.", 409)
-        operation_id, error = mutating("start", body)
+        def start_guard(_: Any, state: Any) -> None:
+            if not state["validated"]:
+                raise LeaseConflict("Lab state must be validated before start.")
+
+        operation_id, error = mutating("start", body, start_guard)
         if error:
             return error
+        current = store.status()
         return run_transition(operation_id, "start", lifecycle.start, {"lifecycle": "RUNNING", "validated": True, "scenario": None, "token_expires_at": current["token_expires_at"]})
 
     @app.post("/management/v1/stop")
@@ -167,9 +178,7 @@ def create_management_app(*, store: ControlStore, lifecycle: RunLifecycle, ident
             body = _payload(set())
         except ValueError as exc:
             return _error("invalid_request", str(exc), 422)
-        if store.active_leases():
-            return _error("evaluation_busy", "Active evaluation leases block stop.", 409)
-        operation_id, error = mutating("stop", body)
+        operation_id, error = mutating("stop", body, store.require_no_unreleased_leases)
         if error:
             return error
         current = store.status()
@@ -186,9 +195,13 @@ def create_management_app(*, store: ControlStore, lifecycle: RunLifecycle, ident
             return _error("invalid_request", str(exc), 422)
         if body["confirm_invalidate_tokens"] is not True:
             return _error("invalid_request", "Token invalidation confirmation is required.", 422)
-        if store.status()["lifecycle"] != "STOPPED" or store.active_leases():
-            return _error("state_conflict", "Reset requires stopped state without active leases.", 409)
-        operation_id, error = mutating("reset", body)
+
+        def reset_guard(connection: Any, state: Any) -> None:
+            if state["lifecycle"] != "STOPPED":
+                raise LeaseConflict("Reset requires stopped state.")
+            store.require_no_unreleased_leases(connection, state)
+
+        operation_id, error = mutating("reset", body, reset_guard)
         if error:
             return error
         return run_transition(operation_id, "reset", lambda: lifecycle.reset(body["scenario"], body["token_ttl_seconds"]), lambda expiry: {"lifecycle": "STOPPED", "validated": False, "scenario": body["scenario"], "token_expires_at": expiry, "rotate_generation": True})

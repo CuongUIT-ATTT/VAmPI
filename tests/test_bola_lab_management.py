@@ -11,6 +11,7 @@ from pathlib import Path
 from bola_lab.control.identity import IdentityError, MTLSIdentityProvider, ManagementIdentity, StaticTestIdentityProvider
 from bola_lab.control.lifecycle import RunLifecycle
 from bola_lab.control.store import ControlStore, LeaseConflict
+from bola_lab.control.systemd import SupervisorError
 from bola_lab.management import create_management_app
 
 
@@ -19,17 +20,22 @@ class FakeSystemd:
         self.state = "inactive"
         self.starts = 0
         self.stops = 0
+        self.start_result: str | None = None
+        self.stop_result: str | None = None
+        self.start_error = False
 
     def status(self) -> str:
         return self.state
 
     def start(self) -> None:
         self.starts += 1
-        self.state = "active"
+        if self.start_error:
+            raise SupervisorError("simulated timeout")
+        self.state = self.start_result or "active"
 
     def stop(self) -> None:
         self.stops += 1
-        self.state = "inactive"
+        self.state = self.stop_result or "inactive"
 
 
 class BolaLabManagementTests(unittest.TestCase):
@@ -116,6 +122,71 @@ class BolaLabManagementTests(unittest.TestCase):
         reset = self.request("POST", "/management/v1/reset", self.operator, body={"scenario": "S02", "token_ttl_seconds": 3600, "confirm_invalidate_tokens": True}, headers=self.mutation_headers("4", "f" * 16))
         self.assertEqual(reset.status_code, 202)
         self.assertEqual(self.store.status()["credential_generation"], 2)
+
+    def initialize_validated_running_lab(self) -> None:
+        init = self.request("POST", "/management/v1/init", self.operator, body={"scenario": "S01", "token_ttl_seconds": 3600}, headers=self.mutation_headers())
+        self.assertEqual(init.status_code, 202)
+        validate = self.request("POST", "/management/v1/validate", self.operator, body={}, headers=self.mutation_headers("1", "b" * 16))
+        self.assertEqual(validate.status_code, 202)
+        start = self.request("POST", "/management/v1/start", self.operator, body={}, headers=self.mutation_headers("2", "c" * 16))
+        self.assertEqual(start.status_code, 202)
+
+    def test_expired_unreleased_lease_blocks_stop_until_explicit_release(self) -> None:
+        self.initialize_validated_running_lab()
+        lease = self.request("POST", "/management/v1/evaluation-leases", self.evaluator, body={"duration_seconds": 60})
+        self.assertEqual(lease.status_code, 201)
+        connection = sqlite3.connect(self.store.path)
+        try:
+            connection.execute("UPDATE leases SET expires_at = 0 WHERE lease_id = ?", (lease.json["lease_id"],))
+            connection.commit()
+        finally:
+            connection.close()
+        status = self.request("GET", "/management/v1/status", self.reader)
+        self.assertEqual(status.json["evaluation_leases"], {"active": 0, "expired_unreleased": 1})
+        stop = self.request("POST", "/management/v1/stop", self.operator, body={}, headers=self.mutation_headers("3", "d" * 16))
+        self.assertEqual(stop.status_code, 409)
+        release = self.request("DELETE", f"/management/v1/evaluation-leases/{lease.json['lease_id']}", self.evaluator)
+        self.assertEqual(release.status_code, 204)
+        stop = self.request("POST", "/management/v1/stop", self.operator, body={}, headers=self.mutation_headers("3", "e" * 16))
+        self.assertEqual(stop.status_code, 202)
+
+    def test_replay_precedes_state_checks_and_reservation_blocks_new_lease(self) -> None:
+        self.initialize_validated_running_lab()
+        reservation, _ = self.store.begin_operation("spiffe://lab/operator", "stop", "e" * 16, "3", {})
+        lease = self.request("POST", "/management/v1/evaluation-leases", self.evaluator, body={"duration_seconds": 60})
+        self.assertEqual(lease.status_code, 409)
+        self.store.fail_operation(reservation, "test_cleanup")
+
+        headers = self.mutation_headers("3", "d" * 16)
+        first = self.request("POST", "/management/v1/stop", self.operator, body={}, headers=headers)
+        self.assertEqual(first.status_code, 202)
+        replay = self.request("POST", "/management/v1/stop", self.operator, body={}, headers=headers)
+        self.assertEqual(replay.status_code, 202)
+        self.assertEqual(replay.json["operation_id"], first.json["operation_id"])
+
+    def test_indeterminate_supervisor_transition_marks_control_state_unknown(self) -> None:
+        init = self.request("POST", "/management/v1/init", self.operator, body={"scenario": "S01", "token_ttl_seconds": 3600}, headers=self.mutation_headers())
+        self.assertEqual(init.status_code, 202)
+        validate = self.request("POST", "/management/v1/validate", self.operator, body={}, headers=self.mutation_headers("1", "b" * 16))
+        self.assertEqual(validate.status_code, 202)
+        self.systemd.start_result = "activating"
+        start = self.request("POST", "/management/v1/start", self.operator, body={}, headers=self.mutation_headers("2", "c" * 16))
+        self.assertEqual(start.status_code, 202)
+        self.assertEqual(self.store.operation(start.json["operation_id"])["state"], "UNKNOWN")
+        self.assertEqual(self.store.status()["lifecycle"], "UNKNOWN")
+        blocked = self.request("POST", "/management/v1/stop", self.operator, body={}, headers=self.mutation_headers("3", "d" * 16))
+        self.assertEqual(blocked.status_code, 409)
+
+    def test_supervisor_timeout_marks_control_state_unknown(self) -> None:
+        init = self.request("POST", "/management/v1/init", self.operator, body={"scenario": "S01", "token_ttl_seconds": 3600}, headers=self.mutation_headers())
+        self.assertEqual(init.status_code, 202)
+        validate = self.request("POST", "/management/v1/validate", self.operator, body={}, headers=self.mutation_headers("1", "b" * 16))
+        self.assertEqual(validate.status_code, 202)
+        self.systemd.start_error = True
+        start = self.request("POST", "/management/v1/start", self.operator, body={}, headers=self.mutation_headers("2", "c" * 16))
+        self.assertEqual(start.status_code, 202)
+        self.assertEqual(self.store.operation(start.json["operation_id"])["state"], "UNKNOWN")
+        self.assertEqual(self.store.status()["lifecycle"], "UNKNOWN")
 
     def test_idempotent_replay_does_not_repeat_initialization(self) -> None:
         headers = self.mutation_headers()
