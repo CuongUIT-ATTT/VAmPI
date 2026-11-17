@@ -1,0 +1,33 @@
+{
+  "openapi": "3.1.0",
+  "info": {"title": "Controlled BOLA Management", "version": "0.1.0", "description": "Separate mTLS-only control plane. It never accepts BOLA test bearer tokens."},
+  "servers": [{"url": "https://MANAGEMENT_HOST/management/v1"}],
+  "components": {
+    "securitySchemes": {"managementMTLS": {"type": "mutualTLS"}},
+    "schemas": {
+      "Error": {"type": "object", "required": ["code", "message", "request_id"], "properties": {"code": {"type": "string"}, "message": {"type": "string"}, "request_id": {"type": "string"}}},
+      "Operation": {"type": "object", "required": ["operation_id", "state"], "properties": {"operation_id": {"type": "string"}, "state": {"enum": ["RUNNING", "SUCCEEDED", "FAILED", "UNKNOWN"]}, "result_code": {"type": ["string", "null"]}}},
+      "EmptyObject": {"type": "object", "additionalProperties": false},
+      "LeaseRequest": {"type": "object", "additionalProperties": false, "required": ["duration_seconds"], "properties": {"duration_seconds": {"type": "integer", "minimum": 60, "maximum": 3600}}},
+      "ScenarioRequest": {"type": "object", "additionalProperties": false, "required": ["scenario", "token_ttl_seconds"], "properties": {"scenario": {"enum": ["S01", "S02", "S03", "S04", "S05", "S06", "S07", "S08", "S09", "S10", "S11", "S12"]}, "token_ttl_seconds": {"type": "integer", "minimum": 300, "maximum": 86400, "default": 3600}}}
+    },
+    "parameters": {
+      "IdempotencyKey": {"in": "header", "name": "Idempotency-Key", "required": true, "schema": {"type": "string", "minLength": 16, "maxLength": 128}},
+      "StateVersion": {"in": "header", "name": "If-Match", "required": true, "schema": {"type": "string"}}
+    }
+  },
+  "security": [{"managementMTLS": []}],
+  "paths": {
+    "/status": {"get": {"responses": {"200": {"description": "Redacted lifecycle and lease status"}, "401": {"description": "Verified mTLS identity required", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}}}}},
+    "/scenarios": {"get": {"responses": {"200": {"description": "Public S01-S12 descriptions"}}}},
+    "/init": {"post": {"parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/StateVersion"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ScenarioRequest"}}}}, "responses": {"202": {"description": "Accepted", "headers": {"Location": {"schema": {"type": "string"}}}}, "409": {"description": "State or idempotency conflict"}, "412": {"description": "Stale state version"}, "428": {"description": "Precondition required"}}}},
+    "/validate": {"post": {"parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/StateVersion"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/EmptyObject"}}}}, "responses": {"202": {"description": "Accepted"}}}},
+    "/start": {"post": {"parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/StateVersion"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/EmptyObject"}}}}, "responses": {"202": {"description": "Accepted"}, "409": {"description": "State conflict"}}}},
+    "/stop": {"post": {"parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/StateVersion"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/EmptyObject"}}}}, "responses": {"202": {"description": "Accepted"}, "409": {"description": "Evaluation lease active"}}}},
+    "/reset": {"post": {"parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}, {"$ref": "#/components/parameters/StateVersion"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"allOf": [{"$ref": "#/components/schemas/ScenarioRequest"}, {"type": "object", "required": ["confirm_invalidate_tokens"], "properties": {"confirm_invalidate_tokens": {"const": true}}}]}}}}, "responses": {"202": {"description": "Accepted; prior credentials are invalidated"}, "409": {"description": "Running or evaluation busy"}}}},
+    "/operations/{operation_id}": {"get": {"parameters": [{"in": "path", "name": "operation_id", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Redacted operation", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Operation"}}}}, "404": {"description": "Unknown operation"}}}},
+    "/evaluation-leases": {"post": {"requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/LeaseRequest"}}}}, "responses": {"201": {"description": "Lease acquired"}, "409": {"description": "Lab not running"}}}},
+    "/evaluation-leases/{lease_id}/renew": {"post": {"parameters": [{"in": "path", "name": "lease_id", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/LeaseRequest"}}}}, "responses": {"200": {"description": "Lease renewed"}, "409": {"description": "Lease unavailable"}}}},
+    "/evaluation-leases/{lease_id}": {"delete": {"parameters": [{"in": "path", "name": "lease_id", "required": true, "schema": {"type": "string"}}], "responses": {"204": {"description": "Lease released"}, "404": {"description": "Lease unavailable"}}}}
+  }
+}

@@ -1,7 +1,6 @@
 # Controlled BOLA evaluation lab
 
-Để xem hướng dẫn vận hành từng bước bằng tiếng Việt, bao gồm user được controller tạo sẵn, API public và manual test case S01–S12, xem [hướng dẫn operator tiếng Việt](bola-lab-operator-guide.vi.md).
-
+Để xem hướng dẫn vận hành từng bước bằng tiếng Việt, bao gồm user được controller tạo sẵn, API public và manual test case S01–S12, xem [hướng dẫn operator tiếng Việt](bola-lab-operator-guide.vi.md). Management control plane mTLS riêng được mô tả tại [hướng dẫn Management API](bola-lab-management.vi.md); nó không thuộc public data-plane.
 ## Mục đích và tách biệt với upstream
 
 Repository này có một **Flask service opt-in, triển khai độc lập** để đánh giá BOLA có kiểm soát. Nó không import, sửa đổi hoặc dùng chung persistence với `app.py`, `config.py`, models, routes, database hoặc OpenAPI của VAmPI gốc. Controller ghi Git commit baseline upstream vào từng answer sheet private.
