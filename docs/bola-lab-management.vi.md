@@ -39,6 +39,12 @@ export BOLA_MGMT_STATE_DIR=/var/lib/bola-lab-management
 export BOLA_MGMT_SYSTEMD_UNIT=vampi-bola-lab.service
 export BOLA_MGMT_PORT=5443
 export BOLA_MGMT_ROLE_MAPPING='{"spiffe://lab/operator":"operator","spiffe://lab/auditor":"reader","spiffe://lab/evaluator":"evaluator"}'
+# HTTPS origin chính xác, canonical, không có path và không ghi :443.
+export BOLA_MGMT_CONSOLE_ORIGIN=https://management.example.test
+# Secret riêng, tối thiểu 32 byte; chỉ cấp cho service account/proxy đáng tin cậy.
+export BOLA_MGMT_CONSOLE_CSRF_SECRET='replace-with-a-32-byte-minimum-operator-secret'
+# Tuỳ chọn, 300–1800 giây; mặc định 900.
+export BOLA_MGMT_CONSOLE_CSRF_TTL_SECONDS=900
 ```
 
 ```bash
@@ -48,6 +54,20 @@ python bola_lab_management_app.py
 `BOLA_MGMT_SYSTEMD_UNIT` chỉ chấp nhận một service unit name hợp lệ, được đọc lúc startup. Worker chỉ gọi `systemctl is-active|start|stop` với unit đã pin; request không thể truyền command, argv, unit, state path, target URL hoặc Docker socket. Quyền service account phải dùng policy systemd/polkit/sudo hạn chế đúng unit này. Không chạy launcher trực tiếp trên LAN/Internet; TLS/mTLS reverse proxy là deployment prerequisite.
 
 Control journal dùng `control.sqlite3` trong `BOLA_MGMT_STATE_DIR` mode `0700`/`0600`, tách khỏi `lab.sqlite3` để reset lab không xoá audit/idempotency/lease. Journal chỉ lưu actor, action, request hash, operation ID, lifecycle/version/generation và safe code — không lưu secret/token/body thô. Khi khởi động, operation `RUNNING` bị gián đoạn chuyển `UNKNOWN`; lifecycle write tiếp theo bị chặn để operator reconcile, không tự retry.
+
+## Management Console cùng origin
+
+Console tối giản nằm tại `GET /management/console` trên **cùng HTTPS origin và boundary mTLS** với management API. Đây không phải public BOLA UI, không được thêm vào public OpenAPI và không chạy origin/process riêng. Browser phải đi qua TLS terminator đã xác thực certificate như phần mTLS ở trên; launcher vẫn chỉ bind loopback.
+
+- Console chỉ dùng same-origin request tới `/management/v1/*`; không bật CORS, không dùng bearer token và không dùng CDN/third-party script.
+- HTML, CSS, JS và API đều yêu cầu management identity. `reader` chỉ xem status/scenario/operation; `operator` chỉ có lifecycle; `evaluator` chỉ có lease.
+- Mỗi mutation do browser phát phải có `X-Management-Console: 1`, CSRF HMAC ngắn hạn bind theo subject + certificate fingerprint, `Origin` đúng bằng `BOLA_MGMT_CONSOLE_ORIGIN`, và Fetch Metadata same-origin (`Sec-Fetch-Site: same-origin`, `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`). Direct mTLS automation không đặt marker này vẫn theo contract API hiện có.
+- Token CSRF, operation ID và lease ID chỉ ở memory của trang. Không có URL parameter, localStorage, analytics, service worker cache hay UI để xem/cấp/handoff token BOLA, signing secret, marker, answer sheet, private file/database/state path hay controller log.
+- Response gửi `no-store`, CSP chỉ local `self`, anti-frame, `nosniff` và `no-referrer`. HSTS là trách nhiệm TLS proxy và **không được claim verified** bởi Flask.
+- Console tạo một idempotency key cho mỗi lần lifecycle do người dùng chủ động gửi. Nó poll `Location` tới terminal operation rồi refresh status; không coi `202` là success và không tự tạo mutation retry. Sau `409`/`412`, refresh trạng thái và người vận hành phải gửi lại có chủ đích.
+- Reset vẫn cần checkbox xác nhận trong UI và `confirm_invalidate_tokens=true` qua API. `UNKNOWN` chỉ hiển thị block/escalation; không có force-reconcile/retry trong browser.
+
+> **NOT VERIFIED:** Browser certificate selection, TLS terminator header stripping/injection, exact `Origin` serialization phía proxy, CSP enforcement trên browser triển khai thực và đường mạng Machine A/B phải được nghiệm thu trên Machine B trước khi công nhận deployment.
 
 ## Lifecycle và concurrency
 

@@ -1,6 +1,6 @@
 {
   "openapi": "3.1.0",
-  "info": {"title": "Controlled BOLA Management", "version": "0.1.0", "description": "Separate mTLS-only control plane. It never accepts BOLA test bearer tokens."},
+  "info": {"title": "Controlled BOLA Management", "version": "0.1.0", "description": "Separate mTLS-only control plane. It never accepts BOLA test bearer tokens. The same-origin HTML console is outside this JSON API contract at /management/console; it adds no CORS or credential-handoff capability."},
   "servers": [{"url": "https://MANAGEMENT_HOST/management/v1"}],
   "components": {
     "securitySchemes": {"managementMTLS": {"type": "mutualTLS"}},

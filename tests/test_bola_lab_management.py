@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import html
 import json
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -12,7 +14,7 @@ from bola_lab.control.identity import IdentityError, MTLSIdentityProvider, Manag
 from bola_lab.control.lifecycle import RunLifecycle
 from bola_lab.control.store import ControlStore, LeaseConflict
 from bola_lab.control.systemd import SupervisorError
-from bola_lab.management import create_management_app
+from bola_lab.management import ConsoleConfig, ConsoleConfigurationError, create_management_app
 
 
 class FakeSystemd:
@@ -46,10 +48,17 @@ class BolaLabManagementTests(unittest.TestCase):
         self.state_dir.mkdir(mode=0o700)
         self.store = ControlStore(root / "control-state")
         self.systemd = FakeSystemd()
+        self.console_clock = [1_700_000_000]
+        self.console_config = ConsoleConfig(
+            origin="https://management.example.test",
+            csrf_secret=b"c" * 32,
+            clock=lambda: self.console_clock[0],
+        )
         self.app = create_management_app(
             store=self.store,
             lifecycle=RunLifecycle(str(self.state_dir), self.systemd),
             identity_provider=StaticTestIdentityProvider(),
+            console_config=self.console_config,
         )
         self.client = self.app.test_client()
         self.operator = ManagementIdentity("spiffe://lab/operator", "operator", "aa")
@@ -231,6 +240,111 @@ class BolaLabManagementTests(unittest.TestCase):
         self.assertNotIn("token_ttl_seconds", journal_text)
         self.assertNotIn(str(self.state_dir), journal_text)
         self.assertNotIn("signing_secret", journal_text)
+
+    def console_token(self, identity: ManagementIdentity) -> str:
+        response = self.request("GET", "/management/console", identity)
+        self.assertEqual(response.status_code, 200)
+        match = re.search(r'data-csrf-token="([^"]+)"', response.get_data(as_text=True))
+        self.assertIsNotNone(match)
+        return html.unescape(match.group(1))
+
+    def console_headers(self, identity: ManagementIdentity, token: str) -> dict[str, str]:
+        return {
+            "Origin": self.console_config.origin,
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+            "X-Management-Console": "1",
+            "X-CSRF-Token": token,
+        }
+
+    def test_console_requires_management_identity_and_serves_only_local_assets(self) -> None:
+        missing = self.request("GET", "/management/console", None)
+        self.assertEqual(missing.status_code, 401)
+        asset_missing = self.request("GET", "/management/console/static/management_console.js", None)
+        self.assertEqual(asset_missing.status_code, 401)
+        asset = self.request("GET", "/management/console/static/management_console.js", self.reader)
+        try:
+            self.assertEqual(asset.status_code, 200)
+            self.assertEqual(asset.mimetype, "text/javascript")
+            asset.get_data()
+        finally:
+            asset.close()
+        unknown = self.request("GET", "/management/console/static/other.js", self.reader)
+        self.assertEqual(unknown.status_code, 404)
+
+    def test_console_renders_only_role_appropriate_controls_and_no_private_state(self) -> None:
+        reader = self.request("GET", "/management/console", self.reader).get_data(as_text=True)
+        operator = self.request("GET", "/management/console", self.operator).get_data(as_text=True)
+        evaluator = self.request("GET", "/management/console", self.evaluator).get_data(as_text=True)
+        self.assertNotIn('id="init-form"', reader)
+        self.assertNotIn('id="lease-form"', reader)
+        self.assertIn('id="init-form"', operator)
+        self.assertNotIn('id="lease-form"', operator)
+        self.assertNotIn('id="init-form"', evaluator)
+        self.assertIn('id="lease-form"', evaluator)
+        for body in (reader, operator, evaluator):
+            self.assertNotIn("signing_secret", body)
+            self.assertNotIn("marker-", body)
+            self.assertNotIn(str(self.state_dir), body)
+            self.assertNotIn("certificate_fingerprint", body)
+
+    def test_console_csrf_is_identity_bound_expiring_and_rejects_malformed_input(self) -> None:
+        token = self.console_token(self.operator)
+        headers = self.console_headers(self.operator, token)
+        allowed = self.request("POST", "/management/v1/init", self.operator, body={"scenario": "S01", "token_ttl_seconds": 3600}, headers=headers | self.mutation_headers())
+        self.assertEqual(allowed.status_code, 202)
+
+        wrong_identity = self.request("POST", "/management/v1/validate", self.reader, body={}, headers=self.console_headers(self.reader, token) | self.mutation_headers("1", "b" * 16))
+        self.assertEqual(wrong_identity.status_code, 403)
+        malformed = self.request("POST", "/management/v1/validate", self.operator, body={}, headers=self.console_headers(self.operator, "0.nonce.***") | self.mutation_headers("1", "c" * 16))
+        self.assertEqual(malformed.status_code, 403)
+        self.console_clock[0] += 901
+        expired = self.request("POST", "/management/v1/validate", self.operator, body={}, headers=self.console_headers(self.operator, token) | self.mutation_headers("1", "d" * 16))
+        self.assertEqual(expired.status_code, 403)
+
+    def test_console_mutations_require_exact_origin_and_fetch_metadata_but_direct_api_is_unchanged(self) -> None:
+        token = self.console_token(self.operator)
+        headers = self.console_headers(self.operator, token) | self.mutation_headers()
+        wrong_origin = self.request("POST", "/management/v1/init", self.operator, body={"scenario": "S01", "token_ttl_seconds": 3600}, headers=headers | {"Origin": "https://attacker.example"})
+        self.assertEqual(wrong_origin.status_code, 403)
+        missing_metadata = dict(headers)
+        del missing_metadata["Sec-Fetch-Mode"]
+        rejected = self.request("POST", "/management/v1/init", self.operator, body={"scenario": "S01", "token_ttl_seconds": 3600}, headers=missing_metadata)
+        self.assertEqual(rejected.status_code, 403)
+        direct = self.request("POST", "/management/v1/init", self.operator, body={"scenario": "S01", "token_ttl_seconds": 3600}, headers=self.mutation_headers())
+        self.assertEqual(direct.status_code, 202)
+
+    def test_console_security_headers_apply_without_cors(self) -> None:
+        response = self.request("GET", "/management/console", self.reader)
+        self.assertEqual(response.headers["Cache-Control"], "no-store, max-age=0")
+        self.assertEqual(response.headers["X-Frame-Options"], "DENY")
+        self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+        self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+        self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
+        self.assertNotIn("Access-Control-Allow-Origin", response.headers)
+
+    def test_console_source_keeps_browser_state_ephemeral_and_operation_requests_conservative(self) -> None:
+        root = Path(__file__).parents[1]
+        script = (root / "bola_lab" / "static" / "management_console.js").read_text(encoding="utf-8")
+        template = (root / "bola_lab" / "templates" / "management_console.html").read_text(encoding="utf-8")
+        self.assertIn('"Idempotency-Key"', script)
+        self.assertIn('"If-Match"', script)
+        self.assertIn("pollOperation", script)
+        self.assertIn("X-Management-Console", script)
+        self.assertNotIn("localStorage", script)
+        self.assertNotIn("sessionStorage", script)
+        self.assertNotIn("<script>", template)
+        self.assertNotIn("http://", template)
+        self.assertNotIn("https://", template)
+
+    def test_console_config_rejects_non_https_weak_or_noncanonical_origins(self) -> None:
+        with self.assertRaises(ConsoleConfigurationError):
+            ConsoleConfig(origin="http://management.example.test", csrf_secret=b"c" * 32)
+        with self.assertRaises(ConsoleConfigurationError):
+            ConsoleConfig(origin="https://management.example.test/path", csrf_secret=b"c" * 32)
+        with self.assertRaises(ConsoleConfigurationError):
+            ConsoleConfig(origin="https://management.example.test", csrf_secret=b"short")
 
     def test_public_bola_contract_has_no_management_routes(self) -> None:
         public_contract = (Path(__file__).parents[1] / "openapi_specs" / "bola-lab.openapi.json").read_text(encoding="utf-8")
