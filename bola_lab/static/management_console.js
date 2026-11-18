@@ -7,10 +7,12 @@
   const statusNode = document.querySelector("#status");
   const operationNode = document.querySelector("#operation");
   const credentialMemory = new Map();
+  const revealedCredentials = new Set();
   let status = null;
   let lease = null;
   let refreshTimer = null;
   let credentialClearTimer = null;
+  let credentialRows = [];
 
   const setNotice = (message, level = "") => { notice.textContent = message; notice.dataset.level = level; };
   const randomKey = () => crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "");
@@ -27,7 +29,12 @@
   });
   const clearCredentialMemory = () => {
     credentialMemory.clear();
-    document.querySelectorAll("[data-token]").forEach((node) => { node.textContent = "••••••••"; });
+    revealedCredentials.clear();
+    credentialRows.forEach((credential) => {
+      const token = tokenNode(credential.username);
+      if (token) { token.textContent = "••••••••"; }
+    });
+    document.querySelectorAll("[data-reveal]").forEach((button) => { button.textContent = "Hiện"; });
     if (credentialClearTimer) { window.clearTimeout(credentialClearTimer); credentialClearTimer = null; }
   };
   const scheduleCredentialClear = () => {
@@ -79,17 +86,19 @@
       payload.scenarios.forEach((scenario) => { const option = document.createElement("option"); option.value = scenario.code; option.textContent = `${scenario.code} — ${scenario.description}`; select.append(option); });
     });
   };
+  const tokenNode = (subject) => Array.from(document.querySelectorAll("[data-token]")).find((node) => node.dataset.token === subject);
   const renderCredentials = (credentials) => {
+    credentialRows = credentials;
     const list = document.querySelector("#credential-list");
     if (!list) { return; }
     list.replaceChildren();
     credentials.forEach((credential) => {
       const row = document.createElement("tr");
-      const token = document.createElement("td"); token.dataset.token = credential.username; token.textContent = "••••••••";
+      const token = document.createElement("td"); token.dataset.token = credential.username; token.textContent = revealedCredentials.has(credential.username) ? credentialMemory.get(credential.username) : "••••••••";
       [credential.username, credential.role, formatTime(credential.issued_at), formatTime(credential.expires_at), credential.status].forEach((value) => { const cell = document.createElement("td"); cell.textContent = value; row.append(cell); });
       row.append(token);
       const actions = document.createElement("td");
-      const reveal = document.createElement("button"); reveal.type = "button"; reveal.textContent = credentialMemory.has(credential.username) ? "Ẩn" : "Hiện";
+      const reveal = document.createElement("button"); reveal.type = "button"; reveal.dataset.reveal = credential.username; reveal.textContent = revealedCredentials.has(credential.username) ? "Ẩn" : "Hiện";
       reveal.disabled = credential.status !== "ACTIVE";
       reveal.addEventListener("click", () => revealCredential(credential.username).catch((error) => setNotice(error.message, "error")));
       const copy = document.createElement("button"); copy.type = "button"; copy.textContent = "Sao chép"; copy.disabled = credential.status !== "ACTIVE";
@@ -114,15 +123,33 @@
   };
   const rememberCredential = (credential) => { credentialMemory.set(credential.username, credential.token); scheduleCredentialClear(); };
   const revealCredential = async (subject) => {
-    if (credentialMemory.has(subject)) { credentialMemory.delete(subject); await refreshCredentials(); return; }
-    const { payload } = await mutation(`/management/v1/credentials/${encodeURIComponent(subject)}/reveal`, {});
-    rememberCredential(payload.credential); await refreshCredentials();
-    const node = document.querySelector(`[data-token="${CSS.escape(subject)}"]`); if (node) { node.textContent = payload.credential.token; }
+    const token = tokenNode(subject);
+    const reveal = document.querySelector(`[data-reveal="${subject}"]`);
+    if (revealedCredentials.has(subject)) {
+      revealedCredentials.delete(subject);
+      if (token) { token.textContent = "••••••••"; }
+      if (reveal) { reveal.textContent = "Hiện"; }
+      return;
+    }
+    if (!credentialMemory.has(subject)) {
+      const { payload } = await mutation(`/management/v1/credentials/${encodeURIComponent(subject)}/reveal`, {});
+      rememberCredential(payload.credential);
+    }
+    revealedCredentials.add(subject);
+    if (token) { token.textContent = credentialMemory.get(subject); }
+    if (reveal) { reveal.textContent = "Ẩn"; }
     await refreshCredentialAudit();
+  };
+  const copyToken = async (token) => {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(token);
+      return;
+    }
+    throw new Error("Trình duyệt không cho sao chép tự động. Hãy bấm Hiện rồi sao chép token thủ công.");
   };
   const copyCredential = async (subject) => {
     if (!credentialMemory.has(subject)) { await revealCredential(subject); }
-    await navigator.clipboard.writeText(credentialMemory.get(subject));
+    await copyToken(credentialMemory.get(subject));
     await mutation(`/management/v1/credentials/${encodeURIComponent(subject)}/copy-audit`, {});
     setNotice("Đã sao chép token. Hãy xóa clipboard sau khi hoàn tất.", "success"); await refreshCredentialAudit();
   };
@@ -137,7 +164,7 @@
     if (!status) { await refreshStatus(); }
     const ttl = Number(document.querySelector("#credential-ttl").value);
     const { payload } = await mutation(`/management/v1/credentials/${encodeURIComponent(subject)}/reissue`, { token_ttl_seconds: ttl, confirm_invalidate_previous: true }, { headers: { "Idempotency-Key": randomKey(), "If-Match": status.state_version } });
-    credentialMemory.delete(subject); rememberCredential(payload.credential); await Promise.all([refreshCredentials(), refreshCredentialAudit(), refreshStatus()]);
+    credentialMemory.delete(subject); revealedCredentials.delete(subject); rememberCredential(payload.credential); await Promise.all([refreshCredentials(), refreshCredentialAudit(), refreshStatus()]);
     setNotice(`Đã cấp lại token ${subject}; token trước đó đã không còn hiệu lực.`, "success");
   };
   const revokeCredentials = async () => {
