@@ -51,6 +51,25 @@
       </form>
       <p class="warning">Khi trạng thái là UNKNOWN, console cố ý không cho force retry hoặc reconcile. Thực hiện đối soát ngoài băng theo tài liệu vận hành.</p>
     </section>
+
+    <section id="credentials" aria-labelledby="credentials-heading">
+      <h2 id="credentials-heading">Token kiểm thử</h2>
+      <p class="warning">Token chỉ được giữ tạm trong tab này khi bạn chủ động Hiện hoặc Cấp. Hãy dùng kênh được phê duyệt và xóa clipboard sau khi dùng.</p>
+      <form id="credential-issue-form">
+        <label>Token TTL (giây) <input id="credential-ttl" type="number" min="300" max="86400" value="3600" required></label>
+        <button type="submit" id="credential-issue">Cấp token cho ba role</button>
+      </form>
+      <table>
+        <thead><tr><th>Tài khoản</th><th>Role</th><th>Cấp lúc</th><th>Hết hạn</th><th>Trạng thái</th><th>Token</th><th>Thao tác</th></tr></thead>
+        <tbody id="credential-list"><tr><td colspan="7">Đang tải…</td></tr></tbody>
+      </table>
+      <form id="credential-revoke-form">
+        <label class="confirm"><input id="credential-revoke-confirm" type="checkbox" required> Tôi hiểu mọi token hiện tại sẽ bị từ chối ngay.</label>
+        <button type="submit" class="danger" id="credential-revoke">Thu hồi toàn bộ token</button>
+      </form>
+      <h3>Lịch sử token</h3>
+      <ul id="credential-audit"><li>Đang tải…</li></ul>
+    </section>
     {% endif %}
 
     {% if role == "evaluator" %}

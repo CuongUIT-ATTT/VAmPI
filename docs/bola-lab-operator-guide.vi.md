@@ -6,13 +6,13 @@ Xem thêm [hướng dẫn kỹ thuật và triển khai](bola-lab.md) và [OpenA
 
 ## 1. Mô hình bảo mật và phạm vi
 
-- **Machine B** giữ controller, SQLite, bearer token, marker và answer sheet private.
-- **Machine A** chỉ nhận base URL, OpenAPI public, token được cấp qua kênh bảo vệ và policy/pointer được phép cung cấp.
+- **Machine B** giữ controller, SQLite/credential registry, manifest signing secret, marker và answer sheet private.
+- **Machine A** chỉ nhận base URL, OpenAPI public, token được operator mTLS cấp qua kênh bảo vệ và policy/pointer được phép cung cấp.
 - Public API chỉ có `GET /health`, `GET /me` và `GET /books/{book_id}`.
 - Không có API public để đăng ký user, login, tạo/sửa/xóa book, reset lab, chọn scenario hoặc lấy answer sheet.
 - Không gọi `/createdb`: đó là endpoint của VAmPI gốc, không thuộc BOLA Lab.
 
-> Không commit, in log, gửi qua chat hoặc đưa vào tool Machine A các file `issued-tokens.json`, `active-run.json`, `answer-sheet.json`, `operator-config.json`, `lab.sqlite3` hay `server.lock`.
+> Không commit, in log, gửi qua chat hoặc đưa vào tool Machine A `active-run.json`, `answer-sheet.json`, `operator-config.json`, `lab.sqlite3` hay `server.lock`. Không export hoặc lưu bearer token trong file/script/history; chỉ chuyển từng token cần thiết qua protected channel đã phê duyệt.
 
 ## 2. Cài đặt môi trường BOLA Lab
 
@@ -57,27 +57,25 @@ python -m bola_lab.controller --state-dir "$PWD/bola-lab-state" --scenario S01 -
 python -m bola_lab.controller --state-dir "$PWD/bola-lab-state" validate
 ```
 
-Controller tạo SQLite và các file owner-only (`0700` cho thư mục, `0600` cho file), đồng thời tạo bearer token và marker mới mỗi run. ID resource và authorization semantics vẫn ổn định.
+Controller tạo SQLite và các file owner-only (`0700` cho thư mục, `0600` cho file), manifest signing secret/credential registry trống và marker mới mỗi run. ID resource và authorization semantics vẫn ổn định.
 
-Sau `init` hoặc `reset`, controller in một tóm tắt local-only gồm principal/resource đã seed và đường dẫn tuyệt đối đến artifact private: `lab.sqlite3` (database), `operator-config.json` (pointer, identity/resource và policy), `issued-tokens.json` (bearer token), `active-run.json` (manifest) và `answer-sheet.json` (ground truth). Tóm tắt **không** in bearer token, signing secret, marker, run ID hoặc nội dung answer sheet. Sau `reset`, token và marker cũ đã bị thay thế nên không còn hợp lệ.
+Sau `init` hoặc `reset`, controller chỉ in tóm tắt local-only về principal/resource và artifact private: `lab.sqlite3` (database và registry claims), `operator-config.json` (pointer, identity/resource và policy), `active-run.json` (manifest) và `answer-sheet.json` (ground truth). Tóm tắt **không** in bearer token, signing secret, marker, run ID hoặc nội dung answer sheet. Reset tạo manifest/registry mới nên token và marker cũ không còn hợp lệ.
 
-### Xem account và token cục bộ
+### Xem account và cấp token qua management console
 
-BOLA Lab không dùng password authentication. Mỗi principal chỉ có `username`/`role`; controller tạo bearer token riêng cho từng run. Để xem danh sách account mà **không** in token, chạy trên Machine B:
+BOLA Lab không dùng password authentication. Mỗi principal chỉ có `username`/`role`; lệnh local chỉ xem danh sách account và **không có** subcommand xuất token:
 
 ```bash
 python -m bola_lab.operator_accounts --state-dir "$PWD/bola-lab-state" list
 ```
 
-Để xem token của một account trong terminal operator được bảo vệ, dùng lệnh explicit sau. Lệnh sẽ cảnh báo qua `stderr`; không chạy lệnh này trong terminal được log/chia sẻ và không dán token vào chat, Git hoặc script:
+Sau `init → validate → start`, đăng nhập management console qua mTLS với principal được role-map là `operator`. Chỉ role này được mở **Token kiểm thử** để cấp đúng ba token (`admin`, `userA`, `userB`), chủ động **Hiện** hoặc **Sao chép** từng giá trị. CA trust đơn thuần, `reader`, `evaluator` và BOLA bearer không đủ quyền. Token chỉ tồn tại tạm trong memory tab sau response `Cache-Control: no-store`; không xuất hiện trong URL, Operation/audit, log hay local/session/IndexedDB storage. Xóa clipboard sau khi chuyển token qua protected channel.
 
-```bash
-python -m bola_lab.operator_accounts --state-dir "$PWD/bola-lab-state" show-token userA
-```
+`UNKNOWN` chặn issue/reissue cho đến khi đối soát ngoài băng; revoke-all vẫn được phép vì chỉ giảm quyền. Reissue chỉ khả dụng sau khi token trước đó `EXPIRED` hoặc `REVOKED`; không thay silent token active. Khi kết thúc test, thu hồi toàn bộ token trong console.
 
 ### Token
 
-Operator lấy token từ state private **chỉ qua kênh được bảo vệ**. Khi test thủ công, dùng placeholder sau và thay bằng token được cấp; không ghi giá trị token vào shell history, script, commit hoặc log:
+Khi test thủ công, dùng placeholder sau và thay bằng token được operator cấp; không ghi giá trị token vào shell history, script, commit hoặc log:
 
 ```bash
 export USER_A_TOKEN='<bearer-token-received-securely>'
@@ -189,8 +187,8 @@ Mỗi run chỉ dùng một scenario. Quy trình chuẩn:
 2. Khởi tạo lần đầu bằng `init`, hoặc thay scenario bằng `reset`.
 3. Chạy `validate`.
 4. Khởi động service mới.
-5. Cấp token mới qua kênh bảo vệ và chạy request của `userA`; dùng `userB` làm owner control khi cần.
-6. Dừng service trước khi chuyển scenario tiếp theo.
+5. Operator mTLS mở **Token kiểm thử**, cấp/hiện/sao chép token cho role cần thiết qua protected channel; dùng `userB` làm owner control khi cần.
+6. Thu hồi toàn bộ token khi hoàn tất, rồi dừng service trước khi chuyển scenario tiếp theo.
 
 Ví dụ chuyển sang S03:
 
@@ -202,7 +200,7 @@ python -m bola_lab.controller --state-dir "$PWD/bola-lab-state" --scenario S03 -
 python -m bola_lab.controller --state-dir "$PWD/bola-lab-state" validate
 ```
 
-Sau `reset`, token và marker cũ không còn hợp lệ; luôn dùng token mới được operator cấp.
+Sau `reset`, token và marker cũ không còn hợp lệ; validate/start rồi luôn dùng token mới do operator mTLS cấp trong management console.
 
 ## 7. Danh sách S01–S12
 
@@ -253,7 +251,7 @@ python -m compileall -q bola_lab bola_lab_app.py tests
 python -W error::ResourceWarning -m unittest discover -s tests -v
 ```
 
-Trên Ubuntu với Python 3.14 và commit `d88b351`, các lệnh đã PASS: `13` tests, `OK`, gồm tất cả S01–S12, token invalid/expired, owner control, private-path isolation, S10 ambiguity, S11 byte balance, reset isolation và stale lock cleanup.
+Không coi kết quả test lịch sử là acceptance hiện tại. Chạy các lệnh trên trong environment BOLA trước mỗi thay đổi; suite cover S01–S12, token invalid/expired/revoked, owner control, private-path isolation, reset isolation và lifecycle/console management. Nghiệm thu mTLS thật, proxy header stripping, firewall/Docker/NAT/IPv6 và log policy vẫn phải thực hiện trên deployment.
 
 Các test tạo state tạm và tự cleanup. Test PASS không tạo một dataset bền vững để chạy thủ công; dùng controller `init` khi cần state bền vững.
 

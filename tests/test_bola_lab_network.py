@@ -12,7 +12,8 @@ from unittest.mock import patch
 from bola_lab.controller import initialize_run
 from bola_lab.network import NetworkPolicyError, listener_settings_from_environment, parse_allowed_clients
 from bola_lab.server import create_app
-from bola_lab.storage import read_private_json, state_path
+from bola_lab.storage import issue_initial_credentials, read_private_json, state_path
+from bola_lab.tokens import issue_token
 
 
 class BolaLabNetworkPolicyTests(unittest.TestCase):
@@ -75,7 +76,12 @@ class BolaLabNetworkAdmissionTests(unittest.TestCase):
         self.state_dir = Path(self.temp.name) / "state"
         self.state_dir.mkdir(mode=0o700)
         initialize_run(str(self.state_dir), "S01", 120)
-        self.tokens = read_private_json(state_path(self.state_dir, "tokens"))["tokens"]
+        manifest = read_private_json(state_path(self.state_dir, "manifest"))
+        claims = issue_initial_credentials(self.state_dir, 300, "network-test-credentials")
+        self.tokens = {
+            item["sub"]: issue_token(item["sub"], item["role"], item["jti"], manifest["signing_secret"], item["exp"])
+            for item in claims
+        }
         self.app = None
 
     def tearDown(self) -> None:

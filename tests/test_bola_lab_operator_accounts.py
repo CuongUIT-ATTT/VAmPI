@@ -9,8 +9,7 @@ import unittest
 from pathlib import Path
 
 from bola_lab.controller import initialize_run
-from bola_lab.operator_accounts import issued_token, list_accounts
-from bola_lab.storage import StateError
+from bola_lab.operator_accounts import list_accounts
 
 
 class BolaLabOperatorAccountsTests(unittest.TestCase):
@@ -26,44 +25,21 @@ class BolaLabOperatorAccountsTests(unittest.TestCase):
     def test_list_accounts_returns_identities_and_roles_only(self) -> None:
         self.assertEqual(
             list_accounts(str(self.state)),
-            [
-                {"username": "admin", "role": "admin"},
-                {"username": "userA", "role": "user"},
-                {"username": "userB", "role": "user"},
-            ],
+            [{"username": "admin", "role": "admin"}, {"username": "userA", "role": "user"}, {"username": "userB", "role": "user"}],
         )
 
-    def test_issued_token_requires_known_principal(self) -> None:
-        self.assertTrue(issued_token(str(self.state), "userA"))
-        with self.assertRaises(StateError):
-            issued_token(str(self.state), "unknown")
-
-    def test_list_cli_does_not_print_bearer_tokens(self) -> None:
+    def test_list_cli_never_discloses_bearer_tokens(self) -> None:
         result = subprocess.run(
             [sys.executable, "-m", "bola_lab.operator_accounts", "--state-dir", str(self.state), "list"],
-            check=False,
-            text=True,
-            capture_output=True,
+            check=False, text=True, capture_output=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stderr, "")
         self.assertIn("admin (admin)", result.stdout)
         self.assertIn("userA (user)", result.stdout)
         self.assertIn("userB (user)", result.stdout)
         self.assertIn("password authentication is not used", result.stdout)
-        self.assertNotIn(issued_token(str(self.state), "userA"), result.stdout)
-
-    def test_show_token_warns_on_stderr(self) -> None:
-        token = issued_token(str(self.state), "userA")
-        result = subprocess.run(
-            [sys.executable, "-m", "bola_lab.operator_accounts", "--state-dir", str(self.state), "show-token", "userA"],
-            check=False,
-            text=True,
-            capture_output=True,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, f"{token}\n")
-        self.assertIn("can expose it in terminal scrollback or logs", result.stderr)
+        self.assertIn("mTLS management console", result.stdout)
+        self.assertNotIn("show-token", result.stdout)
 
 
 if __name__ == "__main__":

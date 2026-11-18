@@ -28,6 +28,18 @@ from .control.store import (
     StaleVersion,
 )
 from .scenarios import SCENARIOS
+from .storage import (
+    StateError,
+    read_private_json,
+    state_path,
+    active_claims_for_subject,
+    claims_for_issuance,
+    credential_statuses,
+    issue_initial_credentials,
+    reissue_credential,
+    revoke_all_credentials,
+)
+from .tokens import issue_token
 
 
 class ManagementStartupError(RuntimeError):
@@ -225,6 +237,27 @@ def create_management_app(
             return _error("forbidden", "Management role is not permitted for this operation.", 403)
         return None
 
+    def signed_credential(claims: dict[str, Any]) -> dict[str, Any]:
+        try:
+            manifest = read_private_json(state_path(lifecycle.state_dir, "manifest"))
+            secret = manifest["signing_secret"]
+            if not isinstance(secret, str):
+                raise StateError("Lab credential material is unavailable.")
+            token = issue_token(claims["sub"], claims["role"], claims["jti"], secret, claims["exp"])
+        except (KeyError, StateError) as exc:
+            raise StateError("Lab credential material is unavailable.") from exc
+        return {
+            "username": claims["sub"],
+            "role": claims["role"],
+            "issued_at": claims["issued_at"],
+            "expires_at": claims["exp"],
+            "token": token,
+        }
+
+    def credential_error(action: str, result: str, status: int, message: str, *, subject: str | None = None) -> Response:
+        store.record_credential_audit(identity().subject, action, result, subject=subject)
+        return _error("state_conflict" if status == 409 else "invalid_request", message, status)
+
     def mutating(route: str, body: dict[str, Any], guard: Any = None) -> tuple[str, Response | None]:
 
         try:
@@ -282,7 +315,12 @@ def create_management_app(
         operation_id, error = mutating("init", body)
         if error:
             return error
-        return run_transition(operation_id, "init", lambda: lifecycle.init(body["scenario"], body["token_ttl_seconds"]), lambda expiry: {"lifecycle": "STOPPED", "validated": False, "scenario": body["scenario"], "token_expires_at": expiry, "rotate_generation": True})
+        return run_transition(
+            operation_id,
+            "init",
+            lambda: lifecycle.init(body["scenario"], body["token_ttl_seconds"]),
+            {"lifecycle": "STOPPED", "validated": False, "scenario": body["scenario"], "rotate_generation": True},
+        )
 
     @app.post("/management/v1/validate")
     def validate() -> Response:
@@ -297,8 +335,8 @@ def create_management_app(
         if error:
             return error
         def validate_transition() -> None:
-            expiry = lifecycle.validate()
-            store.finish_operation(operation_id, "ok", lifecycle="STOPPED", validated=True, scenario=None, token_expires_at=expiry)
+            lifecycle.validate()
+            store.finish_operation(operation_id, "ok", lifecycle="STOPPED", validated=True, scenario=None)
         try:
             validate_transition()
         except LifecycleError:
@@ -321,8 +359,7 @@ def create_management_app(
         operation_id, error = mutating("start", body, start_guard)
         if error:
             return error
-        current = store.status()
-        return run_transition(operation_id, "start", lifecycle.start, {"lifecycle": "RUNNING", "validated": True, "scenario": None, "token_expires_at": current["token_expires_at"]})
+        return run_transition(operation_id, "start", lifecycle.start, {"lifecycle": "RUNNING", "validated": True, "scenario": None})
 
     @app.post("/management/v1/stop")
     def stop() -> Response:
@@ -337,7 +374,12 @@ def create_management_app(
         if error:
             return error
         current = store.status()
-        return run_transition(operation_id, "stop", lifecycle.stop, {"lifecycle": "STOPPED", "validated": current["validated"], "scenario": None, "token_expires_at": current["token_expires_at"]})
+        return run_transition(
+            operation_id,
+            "stop",
+            lifecycle.stop,
+            {"lifecycle": "STOPPED", "validated": current["validated"], "scenario": None},
+        )
 
     @app.post("/management/v1/reset")
     def reset() -> Response:
@@ -359,7 +401,159 @@ def create_management_app(
         operation_id, error = mutating("reset", body, reset_guard)
         if error:
             return error
-        return run_transition(operation_id, "reset", lambda: lifecycle.reset(body["scenario"], body["token_ttl_seconds"]), lambda expiry: {"lifecycle": "STOPPED", "validated": False, "scenario": body["scenario"], "token_expires_at": expiry, "rotate_generation": True})
+        return run_transition(
+            operation_id,
+            "reset",
+            lambda: lifecycle.reset(body["scenario"], body["token_ttl_seconds"]),
+            {"lifecycle": "STOPPED", "validated": False, "scenario": body["scenario"], "rotate_generation": True},
+        )
+
+    @app.get("/management/v1/credentials")
+    def credentials() -> Response:
+        denied = require("operator")
+        if denied:
+            return denied
+        try:
+            return _response({"credentials": credential_statuses(lifecycle.state_dir)})
+        except StateError:
+            return _error("service_unavailable", "Credential state is unavailable.", 503)
+
+    @app.post("/management/v1/credentials/issue")
+    def issue_credentials() -> Response:
+        denied = require("operator")
+        if denied:
+            return denied
+        try:
+            body = _payload({"token_ttl_seconds"})
+            if not isinstance(body["token_ttl_seconds"], int) or isinstance(body["token_ttl_seconds"], bool):
+                raise ValueError("Credential lifetime is invalid.")
+        except ValueError as exc:
+            return credential_error("issued", "invalid_request", 422, str(exc))
+        operation_id, error = mutating("credentials/issue", body)
+        if error:
+            if error.status_code != 202:
+                return error
+            try:
+                claims = claims_for_issuance(lifecycle.state_dir, operation_id)
+                if claims:
+                    return _response({"credentials": [signed_credential(item) for item in claims]}, 201)
+            except StateError:
+                pass
+            return error
+        try:
+            claims = claims_for_issuance(lifecycle.state_dir, operation_id)
+            if not claims:
+                claims = issue_initial_credentials(lifecycle.state_dir, body["token_ttl_seconds"], operation_id)
+                store.finish_operation(operation_id, "credentials_issued")
+                store.record_credential_audit(identity().subject, "issued", "ok")
+            return _response({"credentials": [signed_credential(item) for item in claims]}, 201)
+        except StateError as exc:
+            store.fail_operation(operation_id, "credential_issue_rejected")
+            return credential_error("issued", "rejected", 409, str(exc))
+
+    @app.post("/management/v1/credentials/<subject>/reissue")
+    def reissue_credentials(subject: str) -> Response:
+        denied = require("operator")
+        if denied:
+            return denied
+        try:
+            body = _payload({"token_ttl_seconds", "confirm_invalidate_previous"})
+            if body["confirm_invalidate_previous"] is not True:
+                raise ValueError("Previous-token invalidation confirmation is required.")
+            if not isinstance(body["token_ttl_seconds"], int) or isinstance(body["token_ttl_seconds"], bool):
+                raise ValueError("Credential lifetime is invalid.")
+        except ValueError as exc:
+            return credential_error("reissued", "invalid_request", 422, str(exc), subject=subject)
+        operation_id, error = mutating(f"credentials/{subject}/reissue", body)
+        if error:
+            if error.status_code != 202:
+                return error
+            try:
+                claims = claims_for_issuance(lifecycle.state_dir, operation_id)
+                if len(claims) == 1:
+                    payload = signed_credential(claims[0])
+                    payload.update({"previous_status": "REPLAYED", "previous_token_invalid": True})
+                    return _response({"credential": payload}, 201)
+            except StateError:
+                pass
+            return error
+        try:
+            claims = claims_for_issuance(lifecycle.state_dir, operation_id)
+            if claims:
+                current = claims[0]
+                previous_status = "REPLAYED"
+            else:
+                current, previous_status = reissue_credential(lifecycle.state_dir, subject, body["token_ttl_seconds"], operation_id)
+                store.finish_operation(operation_id, "credential_reissued")
+                store.record_credential_audit(identity().subject, "reissued", "ok", subject=subject, role=current["role"])
+            payload = signed_credential(current)
+            payload.update({"previous_status": previous_status, "previous_token_invalid": True})
+            return _response({"credential": payload}, 201)
+        except StateError as exc:
+            store.fail_operation(operation_id, "credential_reissue_rejected")
+            return credential_error("reissued", "rejected", 409, str(exc), subject=subject)
+
+    @app.post("/management/v1/credentials/revoke-all")
+    def revoke_credentials() -> Response:
+        denied = require("operator")
+        if denied:
+            return denied
+        try:
+            body = _payload({"confirm_revoke_all"})
+            if body["confirm_revoke_all"] is not True:
+                raise ValueError("Credential revocation confirmation is required.")
+        except ValueError as exc:
+            return credential_error("revoked", "invalid_request", 422, str(exc))
+        operation_id, error = mutating("credentials/revoke-all", body)
+        if error:
+            if error.status_code != 202:
+                return error
+            try:
+                return _response({"revoked": 0, "credentials": credential_statuses(lifecycle.state_dir)})
+            except StateError:
+                return error
+        try:
+            revoked = revoke_all_credentials(lifecycle.state_dir)
+            store.finish_operation(operation_id, "credentials_revoked")
+            store.record_credential_audit(identity().subject, "revoked", "ok")
+            return _response({"revoked": revoked, "credentials": credential_statuses(lifecycle.state_dir)})
+        except StateError as exc:
+            store.fail_operation(operation_id, "credential_revoke_rejected")
+            return credential_error("revoked", "rejected", 409, str(exc))
+
+    @app.post("/management/v1/credentials/<subject>/reveal")
+    def reveal_credential(subject: str) -> Response:
+        denied = require("operator")
+        if denied:
+            return denied
+        try:
+            claims = active_claims_for_subject(lifecycle.state_dir, subject)
+            store.record_credential_audit(identity().subject, "revealed", "ok", subject=subject, role=claims["role"])
+            return _response({"credential": signed_credential(claims)})
+        except StateError:
+            return credential_error("revealed", "unavailable", 409, "Active credential is unavailable.", subject=subject)
+
+    @app.post("/management/v1/credentials/<subject>/copy-audit")
+    def copy_credential_audit(subject: str) -> Response:
+        denied = require("operator")
+        if denied:
+            return denied
+        try:
+            claims = active_claims_for_subject(lifecycle.state_dir, subject)
+            store.record_credential_audit(identity().subject, "copy_requested", "ok", subject=subject, role=claims["role"])
+            return Response(status=204)
+        except StateError:
+            return credential_error("copy_requested", "unavailable", 409, "Active credential is unavailable.", subject=subject)
+
+    @app.get("/management/v1/credentials/audit")
+    def credential_audit() -> Response:
+        denied = require("operator")
+        if denied:
+            return denied
+        try:
+            return _response({"events": store.credential_audit()})
+        except ValueError:
+            return _error("invalid_request", "Audit history is unavailable.", 422)
 
     @app.get("/management/v1/operations/<operation_id>")
     def operation(operation_id: str) -> Response:

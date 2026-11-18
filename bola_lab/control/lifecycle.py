@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,15 +23,14 @@ class RunLifecycle:
     state_dir: str
     supervisor: SystemdAdapter
 
-    def _manifest_expiry(self) -> int | None:
+    def _valid_manifest(self) -> bool:
         try:
-            data = read_private_json(state_path(ensure_private_directory(self.state_dir), "tokens"))
+            data = read_private_json(state_path(ensure_private_directory(self.state_dir), "manifest"))
         except StateError:
-            return None
-        value = data.get("expires_at")
-        return value if isinstance(value, int) else None
+            return False
+        return isinstance(data.get("signing_secret"), str) and len(data["signing_secret"]) >= 24
 
-    def init(self, scenario: str, ttl: int) -> int:
+    def init(self, scenario: str, ttl: int) -> None:
         if scenario not in SCENARIO_IDS or not 300 <= ttl <= 86400:
             raise LifecycleError("Requested scenario or token lifetime is invalid.")
         if state_path(self.state_dir, "manifest").exists():
@@ -43,27 +41,22 @@ class RunLifecycle:
             initialize_run(self.state_dir, scenario, ttl)
         except StateError as exc:
             raise LifecycleError("Lab state could not be initialized safely.") from exc
-        expiry = self._manifest_expiry()
-        if expiry is None:
+        if not self._valid_manifest():
             raise LifecycleError("Lab state could not be initialized safely.")
-        return expiry
 
-    def validate(self) -> int:
+    def validate(self) -> None:
         if self.supervisor.status() not in {"inactive", "failed"}:
             raise LifecycleError("Lab service state is not safely stopped.")
         try:
             validate_run(self.state_dir)
         except StateError as exc:
             raise LifecycleError("Lab state validation failed.") from exc
-        expiry = self._manifest_expiry()
-        if expiry is None:
+        if not self._valid_manifest():
             raise LifecycleError("Lab state validation failed.")
-        return expiry
 
     def start(self) -> None:
-        expiry = self._manifest_expiry()
-        if expiry is None or expiry <= int(time.time()):
-            raise LifecycleError("Lab credentials are expired or unavailable.")
+        if not self._valid_manifest():
+            raise LifecycleError("Lab credentials are unavailable.")
         try:
             self.supervisor.start()
             status = self.supervisor.status()
@@ -87,7 +80,7 @@ class RunLifecycle:
             raise LifecycleError("Lab service did not become inactive.")
         raise IndeterminateLifecycleError("Lab service outcome is unknown.")
 
-    def reset(self, scenario: str, ttl: int) -> int:
+    def reset(self, scenario: str, ttl: int) -> None:
         if scenario not in SCENARIO_IDS or not 300 <= ttl <= 86400:
             raise LifecycleError("Requested scenario or token lifetime is invalid.")
         if self.supervisor.status() not in {"inactive", "failed"}:
@@ -96,7 +89,5 @@ class RunLifecycle:
             reset_run(self.state_dir, scenario, ttl)
         except StateError as exc:
             raise LifecycleError("Lab state could not be reset safely.") from exc
-        expiry = self._manifest_expiry()
-        if expiry is None:
+        if not self._valid_manifest():
             raise LifecycleError("Lab state could not be reset safely.")
-        return expiry

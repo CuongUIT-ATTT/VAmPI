@@ -1,4 +1,4 @@
-"""Minimal signed bearer tokens for the isolated lab service."""
+"""Signed, revocable bearer tokens for the isolated lab service."""
 
 from __future__ import annotations
 
@@ -22,28 +22,35 @@ def _decode(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
-def issue_token(username: str, secret: str, expires_at: int) -> str:
-    payload = json.dumps({"sub": username, "exp": expires_at}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+def issue_token(username: str, role: str, jti: str, secret: str, expires_at: int) -> str:
+    """Create a canonical v2 bearer without persisting its serialized value."""
+    if not all(isinstance(value, str) and value for value in (username, role, jti)) or not isinstance(expires_at, int):
+        raise TokenError("Invalid credential claims")
+    payload = json.dumps(
+        {"exp": expires_at, "jti": jti, "role": role, "sub": username}, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
     encoded_payload = _encode(payload)
     signature = hmac.new(secret.encode("utf-8"), encoded_payload.encode("ascii"), hashlib.sha256).digest()
-    return f"v1.{encoded_payload}.{_encode(signature)}"
+    return f"v2.{encoded_payload}.{_encode(signature)}"
 
 
 def verify_token(token: str, secret: str, now: int | None = None) -> dict[str, Any]:
     try:
         version, encoded_payload, encoded_signature = token.split(".")
-        if version != "v1":
+        if version != "v2":
             raise TokenError("Unsupported token")
         expected = hmac.new(secret.encode("utf-8"), encoded_payload.encode("ascii"), hashlib.sha256).digest()
         if not hmac.compare_digest(expected, _decode(encoded_signature)):
             raise TokenError("Bad signature")
         payload = json.loads(_decode(encoded_payload))
-        if not isinstance(payload.get("sub"), str) or not isinstance(payload.get("exp"), int):
+        if set(payload) != {"sub", "role", "jti", "exp"}:
             raise TokenError("Malformed payload")
-        if payload["exp"] <= (int(time.time()) if now is None else now):
+        if not all(isinstance(payload[name], str) and payload[name] for name in ("sub", "role", "jti")):
+            raise TokenError("Malformed payload")
+        if not isinstance(payload["exp"], int) or payload["exp"] <= (int(time.time()) if now is None else now):
             raise TokenError("Expired token")
         return payload
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
         if isinstance(exc, TokenError):
             raise
         raise TokenError("Invalid token") from exc

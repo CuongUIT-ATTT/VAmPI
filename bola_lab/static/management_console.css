@@ -1,7 +1,8 @@
 :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #10151f; color: #e9edf4; }
-body { margin: 0; } main { max-width: 900px; margin: 0 auto; padding: 2rem 1rem 4rem; }
+body { margin: 0; } main { max-width: 1100px; margin: 0 auto; padding: 2rem 1rem 4rem; }
 header, section { background: #182230; border: 1px solid #2a3b50; border-radius: .65rem; padding: 1.25rem; margin-block: 1rem; }
 h1, h2, p { margin-top: 0; } .eyebrow { color: #85b9ff; font-size: .8rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 dl { display: grid; grid-template-columns: max-content 1fr; gap: .4rem 1rem; } dt { color: #aab9ca; } dd { margin: 0; font-family: ui-monospace, monospace; }
 form, .actions { display: flex; gap: .8rem; flex-wrap: wrap; align-items: end; margin-top: 1rem; } label { display: grid; gap: .35rem; color: #c8d3e1; } .confirm { display: flex; align-items: center; max-width: 34rem; }
 input, select, button { border-radius: .35rem; border: 1px solid #4a617a; padding: .55rem .7rem; font: inherit; } input, select { background: #10151f; color: inherit; } button { background: #1463b8; color: white; cursor: pointer; } button:disabled { cursor: not-allowed; opacity: .5; } .danger { background: #a7333b; } .warning { color: #ffcf8b; margin-top: 1rem; } #notice[data-level="error"] { color: #ff9ba2; } #notice[data-level="success"] { color: #a8e6a2; }
+table { width: 100%; border-collapse: collapse; margin-top: 1rem; } th, td { border-bottom: 1px solid #2a3b50; padding: .55rem; text-align: left; vertical-align: top; } th { color: #aab9ca; } td button { margin: .15rem; }

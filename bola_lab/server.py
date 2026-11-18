@@ -16,6 +16,7 @@ from .scenarios import full_resource, scenario_for, serialize_unauthorized
 from .storage import (
     StateError,
     ensure_private_directory,
+    credential_is_active,
     fetch_book,
     fetch_first_owned_book,
     fetch_principal,
@@ -97,7 +98,7 @@ def create_app(state_dir_text: str | None = None) -> Flask:
         manifest = read_private_json(state_path(state_dir, "manifest"))
         _validate_manifest(manifest)
         # Controller-created files must exist before the process exposes HTTP.
-        for name in ("database", "tokens", "operator", "answers"):
+        for name in ("database", "operator", "answers"):
             if not state_path(state_dir, name).is_file():
                 raise StartupError("The prepared lab state is incomplete.")
         scenario = scenario_for(manifest["scenario"])
@@ -132,8 +133,10 @@ def create_app(state_dir_text: str | None = None) -> Flask:
                 return _json_response({"error": "unauthorized"}, 401)
             try:
                 payload = verify_token(header.removeprefix("Bearer "), manifest["signing_secret"])
+                if not credential_is_active(state_dir, payload):
+                    raise TokenError("Credential is unavailable")
                 principal = fetch_principal(state_dir, payload["sub"])
-                if principal is None:
+                if principal is None or principal["role"] != payload["role"]:
                     raise TokenError("Unknown principal")
             except TokenError:
                 return _json_response({"error": "unauthorized"}, 401)

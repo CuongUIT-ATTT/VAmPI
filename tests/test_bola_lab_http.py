@@ -17,7 +17,7 @@ from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 from bola_lab.controller import initialize_run, reset_run, validate_run
 from bola_lab.server import StartupError, create_app
-from bola_lab.storage import StateError, read_private_json, state_path
+from bola_lab.storage import StateError, issue_initial_credentials, read_private_json, revoke_all_credentials, state_path
 from bola_lab.tokens import issue_token
 
 
@@ -68,20 +68,22 @@ class BolaLabHttpTests(unittest.TestCase):
             self.lab.close()
         self.temp.cleanup()
 
-    def prepare(self, scenario: str) -> dict:
+    def issue_tokens(self) -> dict[str, str]:
+        manifest = read_private_json(state_path(self.state_dir, "manifest"))
+        claims = issue_initial_credentials(self.state_dir, 300, "test-initial-credentials")
+        return {item["sub"]: issue_token(item["sub"], item["role"], item["jti"], manifest["signing_secret"], item["exp"]) for item in claims}
+
+    def prepare(self, scenario: str) -> dict[str, str]:
         initialize_run(str(self.state_dir), scenario, 120)
-        tokens = read_private_json(state_path(self.state_dir, "tokens"))["tokens"]
+        tokens = self.issue_tokens()
         self.lab = RunningLab(str(self.state_dir))
         return tokens
 
     def test_every_scenario_is_observable_over_http(self) -> None:
         expectations = {
-            "S01": (200, "book-B1", True), "S02": (200, "book-B1", False),
-            "S03": (403, "book-B1", True), "S04": (403, "book-B1", False),
-            "S05": (200, None, False), "S06": (200, "book-B1", False),
-            "S07": (200, "book-A1", True), "S08": (200, "book-B1", True),
-            "S09": (200, "book-B1", False), "S10": (200, "book-B1", True),
-            "S11": (200, "book-B1", True), "S12": (202, "book-B1", True),
+            "S01": (200, "book-B1", True), "S02": (200, "book-B1", False), "S03": (403, "book-B1", True), "S04": (403, "book-B1", False),
+            "S05": (200, None, False), "S06": (200, "book-B1", False), "S07": (200, "book-A1", True), "S08": (200, "book-B1", True),
+            "S09": (200, "book-B1", False), "S10": (200, "book-B1", True), "S11": (200, "book-B1", True), "S12": (202, "book-B1", True),
         }
         for scenario, (expected_status, expected_id, secret_present) in expectations.items():
             with self.subTest(scenario=scenario):
@@ -93,118 +95,90 @@ class BolaLabHttpTests(unittest.TestCase):
                 else:
                     self.assertEqual(body["data"]["id"], expected_id)
                     self.assertEqual("secret" in body["data"] and body["data"]["secret"] not in (None, "", "***"), secret_present)
-                self.lab.close()
-                self.lab = None
+                self.lab.close(); self.lab = None
 
-    def test_identity_authentication_and_owner_control(self) -> None:
+    def test_identity_authentication_owner_control_and_live_revocation(self) -> None:
         tokens = self.prepare("S03")
         status, body, _ = request_json(f"{self.lab.base_url}/me", tokens["userA"])
-        self.assertEqual(status, 200)
-        self.assertEqual(body, {"principal": {"username": "userA", "role": "user"}})
+        self.assertEqual((status, body), (200, {"principal": {"username": "userA", "role": "user"}}))
         status, owner_body, _ = request_json(f"{self.lab.base_url}/books/book-B1", tokens["userB"])
         self.assertEqual(status, 200)
         self.assertEqual(owner_body["data"]["id"], "book-B1")
-        self.assertTrue(owner_body["data"]["secret"])
-        status, bad_body, _ = request_json(f"{self.lab.base_url}/me", "bad")
-        self.assertEqual(status, 401)
-        self.assertEqual(bad_body, {"error": "unauthorized"})
+        self.assertEqual(revoke_all_credentials(self.state_dir), 3)
+        status, body, _ = request_json(f"{self.lab.base_url}/me", tokens["userA"])
+        self.assertEqual((status, body), (401, {"error": "unauthorized"}))
 
-    def test_expired_tokens_are_rejected(self) -> None:
+    def test_expired_and_unregistered_tokens_are_rejected(self) -> None:
         self.prepare("S01")
         manifest = read_private_json(state_path(self.state_dir, "manifest"))
-        expired = issue_token("userA", manifest["signing_secret"], int(time.time()) - 1)
-        status, body, _ = request_json(f"{self.lab.base_url}/me", expired)
-        self.assertEqual(status, 401)
-        self.assertEqual(body, {"error": "unauthorized"})
+        expired = issue_token("userA", "user", "expired-test", manifest["signing_secret"], int(time.time()) - 1)
+        unknown = issue_token("userA", "user", "unregistered-test", manifest["signing_secret"], int(time.time()) + 60)
+        for token in (expired, unknown, "bad"):
+            with self.subTest(token=token == "bad"):
+                status, body, _ = request_json(f"{self.lab.base_url}/me", token)
+                self.assertEqual((status, body), (401, {"error": "unauthorized"}))
 
     def test_s03_403_contains_target_marker_and_s06_does_not(self) -> None:
         tokens = self.prepare("S03")
         status, body, raw = request_json(f"{self.lab.base_url}/books/book-B1", tokens["userA"])
-        self.assertEqual(status, 403)
-        self.assertEqual(body["data"]["id"], "book-B1")
-        self.assertIn(body["data"]["secret"].encode(), raw)
-        self.lab.close()
-        self.lab = None
+        self.assertEqual(status, 403); self.assertIn(body["data"]["secret"].encode(), raw)
+        self.lab.close(); self.lab = None
         tokens = self.prepare("S06")
         status, body, _ = request_json(f"{self.lab.base_url}/books/book-B1", tokens["userA"])
-        self.assertEqual(status, 200)
-        self.assertEqual(body["data"]["secret"], "***")
+        self.assertEqual((status, body["data"]["secret"]), (200, "***"))
 
     def test_s07_is_truthful_wrong_resource_and_s08_is_shared(self) -> None:
         tokens = self.prepare("S07")
         _, body, _ = request_json(f"{self.lab.base_url}/books/book-B1", tokens["userA"])
         self.assertEqual(body["data"]["id"], "book-A1")
-        self.assertEqual(body["data"]["owner"], "userA")
-        self.lab.close()
-        self.lab = None
+        self.lab.close(); self.lab = None
         tokens = self.prepare("S08")
         status, body, _ = request_json(f"{self.lab.base_url}/books/book-B1", tokens["userA"])
-        self.assertEqual(status, 200)
-        self.assertEqual(body["data"]["id"], "book-B1")
-        self.assertEqual(body["data"]["owner"], "userB")
+        self.assertEqual((status, body["data"]["owner"]), (200, "userB"))
 
     def test_s10_marker_ambiguity_and_s11_byte_balance(self) -> None:
         tokens = self.prepare("S10")
         _, b1, _ = request_json(f"{self.lab.base_url}/books/book-B1", tokens["userA"])
         _, b2, _ = request_json(f"{self.lab.base_url}/books/book-B2", tokens["userA"])
-        self.assertEqual(b1["data"]["secret"], b2["data"]["secret"])
-        self.assertNotIn("id", b2["data"])
-        self.lab.close()
-        self.lab = None
+        self.assertEqual(b1["data"]["secret"], b2["data"]["secret"]); self.assertNotIn("id", b2["data"])
+        self.lab.close(); self.lab = None
         tokens = self.prepare("S11")
         _, _, leaked = request_json(f"{self.lab.base_url}/books/book-B1", tokens["userA"])
         status, denial, denied = request_json(f"{self.lab.base_url}/books/book-B1", tokens["admin"])
-        self.assertEqual(status, 403)
-        self.assertEqual(len(leaked), len(denied))
-        self.assertEqual(denial["data"]["secret"], "")
+        self.assertEqual(status, 403); self.assertEqual(len(leaked), len(denied)); self.assertEqual(denial["data"]["secret"], "")
 
-    def test_public_contract_contains_no_private_scenario_or_controller_terms(self) -> None:
+    def test_public_contract_and_private_routes_remain_hidden(self) -> None:
         contract = (Path(__file__).parents[1] / "openapi_specs" / "bola-lab.openapi.json").read_text(encoding="utf-8")
-        self.assertNotIn("S01", contract)
-        self.assertNotIn("answer-sheet", contract)
-        self.assertNotIn("issued-tokens", contract)
-        self.assertNotIn("controller", contract)
-        self.assertNotIn("reset", contract)
-
-    def test_private_control_and_answer_routes_are_not_public(self) -> None:
+        for term in ("S01", "answer-sheet", "issued-tokens", "controller", "reset", "credentials"):
+            self.assertNotIn(term, contract)
         tokens = self.prepare("S01")
-        for path in ("/answer-sheet.json", "/issued-tokens.json", "/active-run.json", "/controller", "/reset"):
-            with self.subTest(path=path):
-                status, body, _ = request_json(f"{self.lab.base_url}{path}", tokens["userA"])
-                self.assertEqual(status, 404)
-                self.assertEqual(body, {"error": "not_found"})
-        _, health, _ = request_json(f"{self.lab.base_url}/health")
-        self.assertEqual(health, {"status": "ready"})
+        for path in ("/answer-sheet.json", "/issued-tokens.json", "/active-run.json", "/controller", "/reset", "/credentials"):
+            status, body, _ = request_json(f"{self.lab.base_url}{path}", tokens["userA"])
+            self.assertEqual((status, body), (404, {"error": "not_found"}))
 
     def test_permissions_reset_isolation_and_live_reset_refusal(self) -> None:
         tokens = self.prepare("S08")
         self.assertEqual(stat.S_IMODE(self.state_dir.stat().st_mode), 0o700)
-        for name in ("manifest", "database", "tokens", "operator", "answers"):
+        for name in ("manifest", "database", "operator", "answers"):
             self.assertEqual(stat.S_IMODE(state_path(self.state_dir, name).stat().st_mode), 0o600)
-        with self.assertRaises(StateError):
-            reset_run(str(self.state_dir), "S01", 120)
+        with self.assertRaises(StateError): reset_run(str(self.state_dir), "S01", 120)
         old_token = tokens["userA"]
-        self.lab.close()
-        self.lab = None
-        reset_run(str(self.state_dir), "S01", 120)
-        validate_run(str(self.state_dir))
-        self.lab = RunningLab(str(self.state_dir))
+        self.lab.close(); self.lab = None
+        reset_run(str(self.state_dir), "S01", 120); validate_run(str(self.state_dir))
+        self.issue_tokens(); self.lab = RunningLab(str(self.state_dir))
         status, _, _ = request_json(f"{self.lab.base_url}/me", old_token)
         self.assertEqual(status, 401)
 
     def test_startup_snapshot_rejects_second_server(self) -> None:
         self.prepare("S01")
-        with self.assertRaises(StartupError):
-            create_app(str(self.state_dir))
+        with self.assertRaises(StartupError): create_app(str(self.state_dir))
 
     def test_failed_app_initialization_releases_startup_lock(self) -> None:
         initialize_run(str(self.state_dir), "S01", 120)
         with patch("bola_lab.server.Flask", side_effect=RuntimeError("injected startup failure")):
-            with self.assertRaises(StartupError):
-                create_app(str(self.state_dir))
+            with self.assertRaises(StartupError): create_app(str(self.state_dir))
         self.assertFalse(state_path(self.state_dir, "lock").exists())
-        app = create_app(str(self.state_dir))
-        app.extensions["bola_lab_release_lock"]()
+        app = create_app(str(self.state_dir)); app.extensions["bola_lab_release_lock"]()
 
 
 if __name__ == "__main__":

@@ -334,6 +334,8 @@ class BolaLabManagementTests(unittest.TestCase):
         self.assertIn("X-Management-Console", script)
         self.assertNotIn("localStorage", script)
         self.assertNotIn("sessionStorage", script)
+        self.assertNotIn("IndexedDB", script)
+        self.assertNotIn("console.log", script)
         self.assertNotIn("<script>", template)
         self.assertNotIn("http://", template)
         self.assertNotIn("https://", template)
@@ -350,6 +352,70 @@ class BolaLabManagementTests(unittest.TestCase):
         public_contract = (Path(__file__).parents[1] / "openapi_specs" / "bola-lab.openapi.json").read_text(encoding="utf-8")
         self.assertNotIn("management/v1", public_contract)
         self.assertNotIn("credential-handoffs", public_contract)
+
+    def test_operator_issues_revokes_and_audits_credentials_without_journal_leaks(self) -> None:
+        init = self.request("POST", "/management/v1/init", self.operator, body={"scenario": "S01", "token_ttl_seconds": 3600}, headers=self.mutation_headers())
+        self.assertEqual(init.status_code, 202)
+        version = self.store.status()["state_version"]
+        headers = self.mutation_headers(version, "g" * 16)
+        issue = self.request("POST", "/management/v1/credentials/issue", self.operator, body={"token_ttl_seconds": 3600}, headers=headers)
+        self.assertEqual(issue.status_code, 201)
+        tokens = {item["username"]: item["token"] for item in issue.json["credentials"]}
+        self.assertEqual(set(tokens), {"admin", "userA", "userB"})
+        self.assertEqual(issue.headers["Cache-Control"], "no-store, max-age=0")
+        self.assertEqual(self.request("GET", "/management/v1/credentials", self.reader).status_code, 403)
+        status = self.request("GET", "/management/v1/credentials", self.operator)
+        self.assertNotIn(tokens["userA"], status.get_data(as_text=True))
+        self.assertEqual({item["status"] for item in status.json["credentials"]}, {"ACTIVE"})
+        replay = self.request("POST", "/management/v1/credentials/issue", self.operator, body={"token_ttl_seconds": 3600}, headers=headers)
+        self.assertEqual(replay.status_code, 201)
+        self.assertEqual(tokens, {item["username"]: item["token"] for item in replay.json["credentials"]})
+        new_version = self.store.status()["state_version"]
+        revoke = self.request("POST", "/management/v1/credentials/revoke-all", self.operator, body={"confirm_revoke_all": True}, headers=self.mutation_headers(new_version, "h" * 16))
+        self.assertEqual(revoke.status_code, 200)
+        self.assertEqual(revoke.json["revoked"], 3)
+        revoke_replay = self.request(
+            "POST",
+            "/management/v1/credentials/revoke-all",
+            self.operator,
+            body={"confirm_revoke_all": True},
+            headers=self.mutation_headers(new_version, "h" * 16),
+        )
+        self.assertEqual(revoke_replay.status_code, 200)
+        self.assertEqual(revoke_replay.json["revoked"], 0)
+        self.assertEqual({item["status"] for item in revoke_replay.json["credentials"]}, {"REVOKED"})
+        self.assertEqual(self.request("POST", "/management/v1/credentials/userA/reveal", self.operator, body={}).status_code, 409)
+        audit = self.request("GET", "/management/v1/credentials/audit", self.operator)
+        self.assertEqual(audit.status_code, 200)
+        self.assertIn("issued", [item["action"] for item in audit.json["events"]])
+        self.assertIn("revoked", [item["action"] for item in audit.json["events"]])
+        connection = sqlite3.connect(self.store.path)
+        try:
+            journal = "\n".join(str(item) for row in connection.execute("SELECT * FROM operations") for item in row)
+        finally:
+            connection.close()
+        for token in tokens.values():
+            self.assertNotIn(token, journal)
+
+    def test_credential_issue_reissue_block_unknown_and_console_role_separation(self) -> None:
+        init = self.request("POST", "/management/v1/init", self.operator, body={"scenario": "S01", "token_ttl_seconds": 3600}, headers=self.mutation_headers())
+        self.assertEqual(init.status_code, 202)
+        self.assertEqual(self.request("POST", "/management/v1/credentials/issue", self.reader, body={"token_ttl_seconds": 3600}, headers=self.mutation_headers("1", "i" * 16)).status_code, 403)
+        issue = self.request("POST", "/management/v1/credentials/issue", self.operator, body={"token_ttl_seconds": 3600}, headers=self.mutation_headers("1", "j" * 16))
+        self.assertEqual(issue.status_code, 201)
+        active = self.request("POST", "/management/v1/credentials/userA/reissue", self.operator, body={"token_ttl_seconds": 3600, "confirm_invalidate_previous": True}, headers=self.mutation_headers("1", "k" * 16))
+        self.assertEqual(active.status_code, 409)
+        interrupted, replay = self.store.begin_operation(self.operator.subject, "credentials/issue", "q" * 16, "1", {"token_ttl_seconds": 3600})
+        self.assertFalse(replay)
+        self.store.mark_operation_unknown(interrupted, "test")
+        unknown = self.request("POST", "/management/v1/credentials/issue", self.operator, body={"token_ttl_seconds": 3600}, headers=self.mutation_headers(self.store.status()["state_version"], "l" * 16))
+        self.assertEqual(unknown.status_code, 409)
+        revoke = self.request("POST", "/management/v1/credentials/revoke-all", self.operator, body={"confirm_revoke_all": True}, headers=self.mutation_headers(self.store.status()["state_version"], "m" * 16))
+        self.assertEqual(revoke.status_code, 200)
+        operator_html = self.request("GET", "/management/console", self.operator).get_data(as_text=True)
+        reader_html = self.request("GET", "/management/console", self.reader).get_data(as_text=True)
+        self.assertIn('id="credentials"', operator_html)
+        self.assertNotIn('id="credentials"', reader_html)
 
 
 if __name__ == "__main__":

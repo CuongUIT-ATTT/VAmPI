@@ -50,13 +50,13 @@ Controller tạo các file atomic, owner-only (`0700` cho thư mục; `0600` cho
 
 - `active-run.json`: run configuration immutable-at-startup và signing secret;
 - `lab.sqlite3`: principal, resource, actual owner và share;
-- `issued-tokens.json`: bearer token do operator cấp;
+- `lab.sqlite3`: principal/resource/ownership/share và registry credential private; registry chỉ lưu claims/metadata có thể thu hồi, không lưu bearer serialized;
 - `operator-config.json`: pointer và policy input, không có marker hoặc đáp án;
 - `answer-sheet.json`: ground truth và accepted outcome chỉ dành cho evaluator.
 
-Sau `init` hoặc `reset`, controller in ra local-only summary gồm principal/resource đã seed, đường dẫn tuyệt đối tới các artifact trên và bước `validate`/khởi động service tiếp theo. Tóm tắt cố ý **không** in bearer token, signing secret, marker, run ID hay nội dung answer sheet. Token phải được lấy cục bộ từ `issued-tokens.json` bằng quy trình protected-channel của operator; không copy file này hoặc cả state directory sang máy chạy tool.
+Sau `init` hoặc `reset`, controller chỉ in local-only summary của principal/resource/artifact và bước `validate`/khởi động service. Tóm tắt cố ý **không** in bearer token, signing secret, marker, run ID hay nội dung answer sheet. Token chỉ do `operator` đã được map từ mTLS identity cấp, hiện hoặc sao chép bằng **Token kiểm thử** trong management console/API qua protected channel; không copy state directory sang máy chạy tool.
 
-Khi `reset` thành công, controller nêu rõ token bearer và marker cũ đã được thay thế nên token cũ không còn hợp lệ. Chúng được Git ignore nếu tạo tại repository root. Controller từ chối reset hoặc đổi scenario khi server lock chỉ process đang chạy. Service chỉ đọc/validate manifest một lần khi boot, lock run bằng atomic operation và không quan sát thay đổi file config về sau. Dừng process trước khi reset:
+Khi `reset` thành công, manifest và registry credential được tạo mới nên token và marker cũ không còn hợp lệ. Controller từ chối reset hoặc đổi scenario khi server lock chỉ process đang chạy. Service chỉ đọc/validate manifest một lần khi boot, lock run bằng atomic operation và không quan sát thay đổi file config về sau. Dừng process trước khi reset:
 
 ```bash
 python3 -m bola_lab.controller --state-dir "$PWD/bola-lab-state" --scenario S04 --token-ttl 3600 reset
@@ -66,7 +66,7 @@ python3 -m bola_lab.controller --state-dir "$PWD/bola-lab-state" --scenario S04 
 python3 -m bola_lab.controller --state-dir "$PWD/bola-lab-state" validate
 ```
 
-Mỗi lần khởi tạo tạo bearer token và secret marker mới. Resource ID và authorization semantics vẫn deterministic. Chỉ S10 cố ý dùng chung secret marker cho cặp `book-B1`/`book-B2`.
+Mỗi lần khởi tạo tạo signing secret và secret marker mới; credential registry bắt đầu trống. Resource ID và authorization semantics vẫn deterministic. Chỉ S10 cố ý dùng chung secret marker cho cặp `book-B1`/`book-B2`.
 
 BOLA Lab không có password authentication cho principal. Operator có thể xem account/role cục bộ mà không in token:
 
@@ -74,7 +74,7 @@ BOLA Lab không có password authentication cho principal. Operator có thể xe
 python -m bola_lab.operator_accounts --state-dir "$PWD/bola-lab-state" list
 ```
 
-Chỉ trong terminal Machine B được bảo vệ, operator mới dùng `show-token <username>` để in một bearer token hiện hành. Lệnh này chủ động cảnh báo về terminal scrollback/log; không dùng token output trong chat, commit hoặc script.
+Lệnh local không thể in token. Sau `init → validate → start`, operator dùng console quản trị mTLS để cấp đúng ba token, chủ động hiện/sao chép từng token rồi chuyển qua kênh được phê duyệt. Response bearer là `no-store`; token không nằm trong URL, audit/Operation hay browser storage bền vững. Xem [Management API](bola-lab-management.vi.md) để biết role mapping, TTL, revoke và audit.
 
 ## Khởi động service độc lập
 
@@ -136,7 +136,7 @@ docker compose -f docker-compose.lab.yaml down
 docker compose -f docker-compose.lab.yaml run --rm --no-deps bola-lab python -m bola_lab.controller --state-dir /var/lib/bola-lab --scenario S04 --token-ttl 3600 reset
 ```
 
-Chỉ dùng one-off controller container trong operator context của Machine B; nó không in bearer token. Đọc token artifact owner-only tại chỗ qua protected channel được phê duyệt khi cấp token cho Machine A.
+Chỉ dùng one-off controller container trong operator context của Machine B; nó không in bearer token. Sau khi lab chạy, operator mTLS cấp/hiện token trong management console rồi chuyển qua protected channel được phê duyệt tới Machine A; xóa clipboard khi hoàn tất.
 
 ## Dữ liệu và policy
 
@@ -194,7 +194,7 @@ Dùng account/resource list và policy từ `operator-config.json`; chỉ cấp 
 2. **Machine A (tool)**: đặt base URL `http://MACHINE_B:5003`, import public OpenAPI JSON và nhập bearer token thủ công từ operator qua protected channel. Chỉ thêm pointer, identity/resource/policy configuration đã tài liệu hóa và denial convention nếu có.
 3. **Chạy**: giữ ổn định lab process và network path. Không reset hoặc đổi scenario trong lúc chạy.
 4. **Sau khi hoàn tất**: dừng lab ở Machine B, xem private answer sheet cục bộ và so sánh accepted conclusion. Evaluator không gọi tool lại để tạo đáp án.
-5. **Giữa các run**: reset sau khi process kết thúc, cấp token mới và khởi động service process mới.
+5. **Giữa các run**: stop, reset sau khi process kết thúc, validate/start, cấp token mới qua management console và khởi động/kiểm tra service theo lifecycle đã phê duyệt. Thu hồi toàn bộ token khi test hoàn tất.
 
 ## Các tầng xác minh
 

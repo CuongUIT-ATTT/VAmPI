@@ -1,102 +1,51 @@
 # Management API cho Controlled BOLA Lab
 
-> **Trạng thái triển khai:** contract và kiểm thử local đã có. Triển khai Machine B, mTLS thực, systemd, firewall/Tailscale ACL, proxy header stripping, Docker/NAT/IPv6 và nghiệm thu nhiều máy vẫn là **NOT VERIFIED**.
+> **Trạng thái triển khai:** contract và kiểm thử local có coverage cho lifecycle, credential registry và console. Triển khai Machine B với mTLS thật, systemd, firewall/Tailscale ACL, proxy header stripping, Docker/NAT/IPv6 và nghiệm thu nhiều máy vẫn là **NOT VERIFIED**.
 
-Management API là control plane riêng cho operator. Nó **không** thay đổi public BOLA data plane (`GET /health`, `GET /me`, `GET /books/{book_id}`), không thêm route lifecycle vào public service và không sử dụng bearer token BOLA làm thông tin xác thực quản trị.
+Management API là control plane riêng cho operator. Nó không thay đổi public BOLA data plane (`GET /health`, `GET /me`, `GET /books/{book_id}`), không thêm route lifecycle hoặc token vào public service và không dùng bearer token BOLA để xác thực quản trị.
 
-## Phạm vi hiện có
+## Ranh giới mTLS và quyền operator
 
-Prefix là `/management/v1`; đặc tả máy đọc được nằm tại [`openapi_specs/bola-lab-management.openapi.json`](../openapi_specs/bola-lab-management.openapi.json).
+Service bind `127.0.0.1`; TLS terminator phải xác thực mTLS, loại mọi identity/certificate header do client gửi, rồi mới inject `BOLA_MGMT_TLS_VERIFIED=SUCCESS` và WSGI `bola.mtls.identity`. `BOLA_MGMT_ROLE_MAPPING` map subject đã xác thực sang `reader`, `operator` hoặc `evaluator`.
 
-| Route | Role | Mục đích |
+CA trust **không đủ** để cấp quyền Token kiểm thử: chỉ principal có role `operator` được gọi credential endpoints hoặc nhận HTML chứa controls token. `reader`/`evaluator`, BOLA bearer và header tự gửi đều không được xem metadata hay token.
+
+## Token kiểm thử
+
+Sau `init → validate → start`, operator mở `GET /management/console`, vào **Token kiểm thử**, chọn TTL 300–86.400 giây và cấp credential cho đúng ba principal:
+
+| Principal | Role |
+| --- | --- |
+| `admin` | `admin` |
+| `userA` | `user` |
+| `userB` | `user` |
+
+Console hiển thị account, role, lúc cấp, hết hạn và `NOT_ISSUED`/`ACTIVE`/`EXPIRED`/`REVOKED`; token luôn bị che mặc định. Operator phải chủ động **Hiện** hoặc **Sao chép** từng token. Giá trị raw chỉ nằm trong memory tab sau response no-store, bị xóa khi pagehide, timeout, reset hoặc revoke; không dùng URL, localStorage, sessionStorage, IndexedDB, service-worker cache, analytics hay console log. Clipboard thuộc quyền kiểm soát của operator và phải xóa sau khi dùng.
+
+Management API chỉ có trong mTLS control plane:
+
+| Route | Quyền | Mục đích |
 | --- | --- | --- |
-| `GET /status` | reader/operator/evaluator | trạng thái redacted, version, expiry, generation, lease summary |
-| `GET /scenarios` | reader/operator/evaluator | danh sách S01–S12 và mô tả public |
-| `POST /init`, `/validate`, `/start`, `/stop`, `/reset` | operator | lifecycle có idempotency và optimistic version |
-| `GET /operations/{operation_id}` | reader/operator/evaluator | trạng thái operation redacted |
-| `POST /evaluation-leases`, `renew`, `DELETE` | evaluator | interlock hữu hạn cho lượt đánh giá |
+| `GET /credentials` | operator | Metadata redacted của ba credential. |
+| `POST /credentials/issue` | operator | Cấp initial batch với `token_ttl_seconds`. Response bearer là `no-store`. |
+| `POST /credentials/{subject}/reissue` | operator | Cấp lại sau `EXPIRED`/`REVOKED`; response xác nhận token cũ đã vô hiệu. |
+| `POST /credentials/revoke-all` | operator | Thu hồi ngay mọi token active. |
+| `POST /credentials/{subject}/reveal` | operator | Hiện tạm một token active và ghi audit không chứa value. |
+| `POST /credentials/{subject}/copy-audit` | operator | Ghi việc operator yêu cầu copy, không mang credential. |
+| `GET /credentials/audit` | operator | Lịch sử actor/action/account/time/result redacted. |
 
-`POST /credential-handoffs` **chưa tồn tại**. Không có endpoint nào trả bearer token, signing secret, marker, answer sheet, SQLite, state path hoặc controller stdout. Credential handoff bị BLOCKED cho đến khi receiver mTLS và secret storage được thiết kế/triển khai riêng.
+Mọi issue/reissue/revoke cần `Idempotency-Key` và `If-Match`. Issue/reissue bị chặn khi lifecycle `UNKNOWN`; `revoke-all` vẫn được chấp nhận vì chỉ giảm quyền. Reissue không âm thầm thay token active: chỉ credential đã hết hạn hoặc bị thu hồi mới đủ điều kiện. Reset tạo signing secret/registry mới nên tất cả token cũ bị từ chối sau request kế tiếp.
 
-## Ranh giới mTLS bắt buộc
+Credential registry nằm trong private `lab.sqlite3`; không lưu serialized bearer. Token v2 mang `sub`, `role`, `jti`, `exp`, ký HMAC bằng signing secret private. Public GET service kiểm signature/expiry **và** lookup registry ở mỗi request. Token revoked, expired, malformed hoặc từ run cũ luôn nhận neutral `401 {"error":"unauthorized"}` mà không restart service.
 
-Service bind `127.0.0.1` mặc định. Một TLS terminator/operator-managed WSGI integration phải:
+## Audit, caching và console security
 
-1. thực hiện mTLS thật với CA/CRL/certificate policy của operator;
-2. xoá mọi header identity/certificate/forwarding do client gửi;
-3. chỉ khi xác thực thành công mới inject `BOLA_MGMT_TLS_VERIFIED=SUCCESS` và WSGI environ `bola.mtls.identity` chứa JSON canonical `{"subject":"...","fingerprint":"..."}`;
-4. đặt `BOLA_MGMT_ROLE_MAPPING` là JSON mapping protected từ subject sang `reader`, `operator` hoặc `evaluator`.
+Control journal/audit chỉ lưu actor, action, subject/role, timestamp, request hash, operation ID/state và safe result code. Nó không lưu bearer, token payload, `jti`, signing secret, response body, marker, state path hoặc body request thô. `GET /operations/{id}` tiếp tục redacted.
 
-App không đọc `X-Forwarded-For`, `X-Real-IP`, `Forwarded`, `X-Client-Cert`, Authorization bearer hoặc bất kỳ header client nào để nhận diện operator. Thiếu/malformed boundary trả `401` trung tính.
+Mọi response management (kể cả token-bearing response) có `Cache-Control: no-store, max-age=0`, `Pragma: no-cache`, `Expires: 0`, CSP same-origin, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` và `nosniff`. Browser mutation cần exact configured Origin, Fetch Metadata same-origin, `X-Management-Console`, CSRF HMAC bind subject + certificate fingerprint. Không bật CORS.
 
-## Cấu hình và systemd
+## Lifecycle và vận hành
 
-Management launcher cần các biến operator-controlled sau; chúng không được nhận qua HTTP request:
+`init`, `validate`, `start`, `stop`, `reset` giữ nguyên interlock lifecycle/lease. Không có token artifact `issued-tokens.json` hoặc local `show-token` command nữa. Controller chỉ seed data/private manifest; credential do operator mTLS issue sau khi lab chạy. Public API vẫn GET-only và OpenAPI public không chứa credential, registry, management, reset hoặc private state route.
 
-```bash
-export BOLA_LAB_STATE_DIR=/var/lib/bola-lab
-export BOLA_MGMT_STATE_DIR=/var/lib/bola-lab-management
-export BOLA_MGMT_SYSTEMD_UNIT=vampi-bola-lab.service
-export BOLA_MGMT_PORT=5443
-export BOLA_MGMT_ROLE_MAPPING='{"spiffe://lab/operator":"operator","spiffe://lab/auditor":"reader","spiffe://lab/evaluator":"evaluator"}'
-# HTTPS origin chính xác, canonical, không có path và không ghi :443.
-export BOLA_MGMT_CONSOLE_ORIGIN=https://management.example.test
-# Secret riêng, tối thiểu 32 byte; chỉ cấp cho service account/proxy đáng tin cậy.
-export BOLA_MGMT_CONSOLE_CSRF_SECRET='replace-with-a-32-byte-minimum-operator-secret'
-# Tuỳ chọn, 300–1800 giây; mặc định 900.
-export BOLA_MGMT_CONSOLE_CSRF_TTL_SECONDS=900
-```
-
-```bash
-python bola_lab_management_app.py
-```
-
-`BOLA_MGMT_SYSTEMD_UNIT` chỉ chấp nhận một service unit name hợp lệ, được đọc lúc startup. Worker chỉ gọi `systemctl is-active|start|stop` với unit đã pin; request không thể truyền command, argv, unit, state path, target URL hoặc Docker socket. Quyền service account phải dùng policy systemd/polkit/sudo hạn chế đúng unit này. Không chạy launcher trực tiếp trên LAN/Internet; TLS/mTLS reverse proxy là deployment prerequisite.
-
-Control journal dùng `control.sqlite3` trong `BOLA_MGMT_STATE_DIR` mode `0700`/`0600`, tách khỏi `lab.sqlite3` để reset lab không xoá audit/idempotency/lease. Journal chỉ lưu actor, action, request hash, operation ID, lifecycle/version/generation và safe code — không lưu secret/token/body thô. Khi khởi động, operation `RUNNING` bị gián đoạn chuyển `UNKNOWN`; lifecycle write tiếp theo bị chặn để operator reconcile, không tự retry.
-
-## Management Console cùng origin
-
-Console tối giản nằm tại `GET /management/console` trên **cùng HTTPS origin và boundary mTLS** với management API. Đây không phải public BOLA UI, không được thêm vào public OpenAPI và không chạy origin/process riêng. Browser phải đi qua TLS terminator đã xác thực certificate như phần mTLS ở trên; launcher vẫn chỉ bind loopback.
-
-- Console chỉ dùng same-origin request tới `/management/v1/*`; không bật CORS, không dùng bearer token và không dùng CDN/third-party script.
-- HTML, CSS, JS và API đều yêu cầu management identity. `reader` chỉ xem status/scenario/operation; `operator` chỉ có lifecycle; `evaluator` chỉ có lease.
-- Mỗi mutation do browser phát phải có `X-Management-Console: 1`, CSRF HMAC ngắn hạn bind theo subject + certificate fingerprint, `Origin` đúng bằng `BOLA_MGMT_CONSOLE_ORIGIN`, và Fetch Metadata same-origin (`Sec-Fetch-Site: same-origin`, `Sec-Fetch-Mode: cors`, `Sec-Fetch-Dest: empty`). Direct mTLS automation không đặt marker này vẫn theo contract API hiện có.
-- Token CSRF, operation ID và lease ID chỉ ở memory của trang. Không có URL parameter, localStorage, analytics, service worker cache hay UI để xem/cấp/handoff token BOLA, signing secret, marker, answer sheet, private file/database/state path hay controller log.
-- Response gửi `no-store`, CSP chỉ local `self`, anti-frame, `nosniff` và `no-referrer`. HSTS là trách nhiệm TLS proxy và **không được claim verified** bởi Flask.
-- Console tạo một idempotency key cho mỗi lần lifecycle do người dùng chủ động gửi. Nó poll `Location` tới terminal operation rồi refresh status; không coi `202` là success và không tự tạo mutation retry. Sau `409`/`412`, refresh trạng thái và người vận hành phải gửi lại có chủ đích.
-- Reset vẫn cần checkbox xác nhận trong UI và `confirm_invalidate_tokens=true` qua API. `UNKNOWN` chỉ hiển thị block/escalation; không có force-reconcile/retry trong browser.
-
-> **NOT VERIFIED:** Browser certificate selection, TLS terminator header stripping/injection, exact `Origin` serialization phía proxy, CSP enforcement trên browser triển khai thực và đường mạng Machine A/B phải được nghiệm thu trên Machine B trước khi công nhận deployment.
-
-## Lifecycle và concurrency
-
-- State ban đầu: `UNINITIALIZED`.
-- `init` chỉ khi private state chưa tồn tại và service pinned đang inactive/failed.
-- `validate` yêu cầu service stopped; thành công tạo `STOPPED` + `validated=true`.
-- `start` yêu cầu state validated và token chưa hết hạn; supervisor phải xác nhận `active`.
-- `stop` và `reset` bị chặn khi có **bất kỳ lease chưa release** nào, kể cả lease đã hết hạn; hết hạn không chứng minh evaluation đã dừng. Evaluator phải release tường minh sau khi hoàn tất, hoặc operator phải reconcile ngoài băng trước khi thay đổi lifecycle.
-- `reset` chỉ ở `STOPPED`, cần `confirm_invalidate_tokens=true`; token/marker cũ bị rotate và generation tăng.
-- Timeout/supervisor error, final supervisor state `activating`/`deactivating`/`unknown`, hoặc operation interrupted không được coi là success/failure chắc chắn; state `UNKNOWN` yêu cầu reconcile operator.
-
-Mọi lifecycle mutation cần hai header:
-
-```text
-Idempotency-Key: <16-128-character opaque value>
-If-Match: <state_version from GET /status>
-```
-
-Cùng actor/key/route/body trả operation cũ; cùng key nhưng body khác trả `409`; header thiếu trả `428`; version stale trả `412`. Mutation trả `202` và `Location: /management/v1/operations/<opaque-id>`; `GET operation` không chứa private run ID.
-
-Lease là interlock có giới hạn, không chứng minh chắc chắn rằng client manual không còn dùng token. Vì vậy quy trình operator vẫn phải quiesce mọi consumer không được lease tracking bao phủ trước reset. Expiry lease không tự reset hoặc restart lab.
-
-## Khôi phục và rollback
-
-1. Khi management service/service unit crash hoặc status `UNKNOWN`, dừng mọi lifecycle write.
-2. Operator kiểm tra pinned systemd unit, public `/health`, ownership `server.lock`, private artifact permissions và control journal trên Machine B.
-3. Chỉ sau khi reconcile thực tế mới cập nhật/quyết định transition theo quy trình operator; không xoá lock hoặc khôi phục token cũ tự động.
-4. Rollback management service không rollback credential generation hay phát hành lại token cũ.
-
-## Kiểm thử thực tế còn phải làm
-
-Các test local chỉ dùng fake systemd và test identity provider. Trước khi công nhận deployment cần chạy LCA-01…LCA-12 theo LAB-CONTROL-API-01: mTLS certificate/role negative cases, systemd privilege boundary, stop/reset races, crash staging/recovery, token rotation/handoff (sau khi receiver tồn tại), public S01–S12 regression, firewall/Tailscale ACL, spoofed forwarding header, IPv6/direct routing và từ ít nhất một host bị từ chối. Không ghi token, marker, answer-sheet, state path hoặc raw controller output vào evidence Machine A.
+Luồng operator: **Khởi tạo → Validate → Start → mở Token kiểm thử → cấp/hiện/sao chép theo role qua protected channel → chạy kiểm thử → Thu hồi toàn bộ → Stop**. Khi real deployment được nghiệm thu phải kiểm mTLS negative cases, proxy stripping, access logs không ghi `Authorization`/management response body, no-store, firewall/LAN/NAT/IPv6 và token revoked từ Machine A bị từ chối.

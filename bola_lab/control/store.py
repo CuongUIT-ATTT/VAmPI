@@ -62,10 +62,11 @@ class ControlStore:
                 CREATE TABLE IF NOT EXISTS state (
                   singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                   version INTEGER NOT NULL, lifecycle TEXT NOT NULL,
-                  validated INTEGER NOT NULL, scenario TEXT, token_expires_at INTEGER,
+                  validated INTEGER NOT NULL, scenario TEXT,
                   generation INTEGER NOT NULL, updated_at INTEGER NOT NULL
                 );
-                INSERT OR IGNORE INTO state VALUES (1, 0, 'UNINITIALIZED', 0, NULL, NULL, 0, 0);
+                INSERT OR IGNORE INTO state (singleton, version, lifecycle, validated, scenario, generation, updated_at)
+                VALUES (1, 0, 'UNINITIALIZED', 0, NULL, 0, 0);
                 CREATE TABLE IF NOT EXISTS operations (
                   operation_id TEXT PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL,
                   request_hash TEXT NOT NULL, state TEXT NOT NULL, result_code TEXT,
@@ -80,6 +81,11 @@ class ControlStore:
                   lease_id TEXT PRIMARY KEY, actor TEXT NOT NULL, generation INTEGER NOT NULL,
                   expires_at INTEGER NOT NULL, released_at INTEGER, created_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS credential_audit_events (
+                  event_id TEXT PRIMARY KEY, actor TEXT NOT NULL, action TEXT NOT NULL,
+                  subject TEXT, role TEXT, result_code TEXT NOT NULL, created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS credential_audit_recent ON credential_audit_events(created_at DESC);
                 """
             )
             if not self._startup_reconciled:
@@ -136,10 +142,9 @@ class ControlStore:
             ).fetchone()[0]
         return {
             "state_version": str(row["version"]), "lifecycle": row["lifecycle"], "initialized": row["lifecycle"] != "UNINITIALIZED",
-            "validated": bool(row["validated"]), "token_expires_at": row["token_expires_at"],
+            "validated": bool(row["validated"]),
             "credential_generation": row["generation"],
             "evaluation_leases": {"active": active, "expired_unreleased": expired_unreleased},
-            "credential_handoff": "BLOCKED",
         }
 
     def begin_operation(
@@ -166,7 +171,7 @@ class ControlStore:
             current = str(state["version"])
             if version != current:
                 raise StaleVersion("State version is stale.")
-            if state["lifecycle"] == "UNKNOWN":
+            if state["lifecycle"] == "UNKNOWN" and route != "credentials/revoke-all":
                 raise LeaseConflict("Lifecycle state requires operator reconciliation.")
             if connection.execute("SELECT 1 FROM operations WHERE state = 'RUNNING' LIMIT 1").fetchone():
                 raise LeaseConflict("Another lifecycle operation is active.")
@@ -178,12 +183,16 @@ class ControlStore:
             connection.execute("INSERT INTO idempotency VALUES (?, ?, ?, ?, ?, ?)", (actor, route, key, digest, operation_id, now))
             return operation_id, False
 
-    def finish_operation(self, operation_id: str, code: str, *, lifecycle: str | None = None, validated: bool | None = None, scenario: str | None = None, token_expires_at: int | None = None, rotate_generation: bool = False) -> None:
+    def finish_operation(self, operation_id: str, code: str, *, lifecycle: str | None = None, validated: bool | None = None, scenario: str | None = None, rotate_generation: bool = False) -> None:
         with self.transaction() as connection:
             connection.execute("UPDATE operations SET state = 'SUCCEEDED', result_code = ?, completed_at = ? WHERE operation_id = ?", (code, _now(), operation_id))
             if lifecycle is not None:
                 row = connection.execute("SELECT generation FROM state WHERE singleton = 1").fetchone()
-                connection.execute("UPDATE state SET version = version + 1, lifecycle = ?, validated = ?, scenario = COALESCE(?, scenario), token_expires_at = COALESCE(?, token_expires_at), generation = ?, updated_at = ? WHERE singleton = 1", (lifecycle, int(bool(validated)), scenario, token_expires_at, row[0] + int(rotate_generation), _now()))
+                connection.execute(
+                    "UPDATE state SET version = version + 1, lifecycle = ?, validated = ?, "
+                    "scenario = COALESCE(?, scenario), generation = ?, updated_at = ? WHERE singleton = 1",
+                    (lifecycle, int(bool(validated)), scenario, row[0] + int(rotate_generation), _now()),
+                )
                 if rotate_generation:
                     connection.execute("UPDATE leases SET released_at = ? WHERE released_at IS NULL", (_now(),))
 
@@ -205,6 +214,24 @@ class ControlStore:
         with self.connection() as connection:
             row = connection.execute("SELECT operation_id, action, state, result_code, created_at, completed_at FROM operations WHERE operation_id = ?", (operation_id,)).fetchone()
         return dict(row) if row else None
+
+    def record_credential_audit(self, actor: str, action: str, result_code: str, *, subject: str | None = None, role: str | None = None) -> None:
+        """Record an operator action without credential material or request bodies."""
+        with self.transaction() as connection:
+            connection.execute(
+                "INSERT INTO credential_audit_events VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (_id("audit"), actor, action, subject, role, result_code, _now()),
+            )
+
+    def credential_audit(self, limit: int = 100) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 100:
+            raise ValueError("Audit limit is outside the allowed range.")
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT actor, action, subject, role, result_code, created_at "
+                "FROM credential_audit_events ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def active_leases(self) -> bool:
         with self.connection() as connection:

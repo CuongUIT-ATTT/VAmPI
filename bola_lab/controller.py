@@ -25,7 +25,6 @@ from .storage import (
     state_path,
     write_private_json,
 )
-from .tokens import issue_token
 
 PRINCIPALS = [
     {"username": "admin", "role": "admin"},
@@ -157,10 +156,6 @@ def initialize_run(state_dir_text: str, scenario_code: str, token_ttl: int) -> N
         "token_ttl_seconds": token_ttl,
         "signing_secret": signing_secret,
     }
-    issued = {
-        "expires_at": now + token_ttl,
-        "tokens": {item["username"]: issue_token(item["username"], signing_secret, now + token_ttl) for item in PRINCIPALS},
-    }
     operator = {
         "base_url": "http://LAB_HOST:5003",
         "principal_pointer": "/principal/username",
@@ -183,7 +178,6 @@ def initialize_run(state_dir_text: str, scenario_code: str, token_ttl: int) -> N
         "rows": _answer_rows(scenario_code, books, shares),
     }
     write_private_json(state_path(state_dir, "manifest"), manifest)
-    write_private_json(state_path(state_dir, "tokens"), issued)
     write_private_json(state_path(state_dir, "operator"), operator)
     write_private_json(state_path(state_dir, "answers"), answers)
 
@@ -193,11 +187,10 @@ def validate_run(state_dir_text: str) -> None:
     manifest = read_private_json(state_path(state_dir, "manifest"))
     if manifest.get("format") != 1 or manifest.get("scenario") not in SCENARIO_IDS:
         raise StateError("Active run manifest is invalid.")
-    for name in ("database", "tokens", "operator", "answers"):
+    for name in ("database", "operator", "answers"):
         path = state_path(state_dir, name)
         if not path.is_file():
             raise StateError("Required private lab state is unavailable.")
-    read_private_json(state_path(state_dir, "tokens"))
     read_private_json(state_path(state_dir, "operator"))
     read_private_json(state_path(state_dir, "answers"))
 
@@ -213,7 +206,7 @@ def _print_prepared_state_summary(state_dir_text: str, command: str) -> None:
     action = "khởi tạo" if command == "init" else "đặt lại"
     print(f"BOLA Lab đã được {action} thành công.")
     if command == "reset":
-        print("Token bearer và marker private trước đó đã được thay thế; token cũ không còn hợp lệ.")
+        print("Credential và marker private trước đó đã bị vô hiệu hóa; token cũ không còn hợp lệ.")
     print()
     print("Principal đã seed:")
     for principal in PRINCIPALS:
@@ -227,7 +220,6 @@ def _print_prepared_state_summary(state_dir_text: str, command: str) -> None:
     artifact_details = (
         ("database", "Database (principal, resource, ownership và share)"),
         ("operator", "Cấu hình operator (pointer, danh sách identity/resource và policy)"),
-        ("tokens", "Bearer token đã cấp (chỉ đọc cục bộ và phân phối qua kênh bảo vệ)"),
         ("manifest", "Manifest run (cấu hình run và signing secret)"),
         ("answers", "Answer sheet evaluator (ground truth; không cung cấp cho tool)"),
     )
@@ -235,10 +227,11 @@ def _print_prepared_state_summary(state_dir_text: str, command: str) -> None:
         print(f"  - {label}: {state_path(state_dir, name)}")
     print()
     print("Token, signing secret, marker và nội dung answer sheet không được in ra terminal.")
+    print("Cấp token sau khi lab chạy thông qua Token kiểm thử trong management console mTLS.")
     print("Bước tiếp theo:")
     print(f"  1. Xác thực state: python -m bola_lab.controller --state-dir {state_dir} validate")
     print("  2. Khởi động service với BOLA_LAB_STATE_DIR trỏ đến thư mục này.")
-    print("  3. Chỉ lấy token từ issued-tokens.json trên máy operator qua kênh bảo vệ.")
+    print("  3. Sau khi lab chạy, operator cấp token trong management console mTLS qua kênh bảo vệ.")
     print("  4. Không publish, copy sang máy tool hoặc expose state directory qua HTTP.")
 
 
