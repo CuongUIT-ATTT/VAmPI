@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Controlled BOLA Management Console</title>
+  <link rel="stylesheet" href="/management/console/static/management_console.css">
+</head>
+<body data-role="{{ role }}" data-csrf-token="{{ csrf_token }}">
+  <main>
+    <header>
+      <p class="eyebrow">mTLS-protected control plane</p>
+      <h1>Controlled BOLA</h1>
+      <p>Vai trò hiện tại: <strong id="role">{{ role }}</strong></p>
+    </header>
+
+    <p id="notice" role="status" aria-live="polite">Đang tải trạng thái quản trị…</p>
+    <section aria-labelledby="status-heading">
+      <h2 id="status-heading">Trạng thái lab</h2>
+      <dl id="status"><dt>Trạng thái</dt><dd>Đang tải…</dd></dl>
+    </section>
+
+    <section aria-labelledby="scenario-heading">
+      <h2 id="scenario-heading">Scenario có sẵn</h2>
+      <ul id="scenarios"><li>Đang tải…</li></ul>
+    </section>
+
+    <section aria-labelledby="operation-heading">
+      <h2 id="operation-heading">Operation</h2>
+      <p id="operation">Chưa có operation trong tab này.</p>
+    </section>
+
+    {% if role == "operator" %}
+    <section aria-labelledby="lifecycle-heading">
+      <h2 id="lifecycle-heading">Vòng đời lab</h2>
+      <form id="start-form">
+        <label>Scenario <select id="scenario" name="scenario" required></select></label>
+        <label>Token TTL (giây) <input id="token-ttl" name="token_ttl_seconds" type="number" min="300" max="86400" value="3600" required></label>
+        <button type="submit" data-lifecycle="start">Start lab</button>
+      </form>
+      <form id="reset-form">
+        <label>Scenario <select id="reset-scenario" name="scenario" required></select></label>
+        <label>Token TTL (giây) <input id="reset-token-ttl" name="token_ttl_seconds" type="number" min="300" max="86400" value="3600" required></label>
+        <label class="confirm"><input id="reset-confirm" type="checkbox" required> Tôi hiểu reset sẽ vô hiệu hoá token và marker hiện tại.</label>
+        <button type="submit" class="danger" data-lifecycle="reset">Reset lab</button>
+      </form>
+      <div class="actions">
+        <button data-lifecycle="stop" class="danger">Stop lab</button>
+      </div>
+      <p class="warning">Start và Reset tự tạo users, books, share, markers, credential registry rồi validate nội bộ. Mỗi thời điểm chỉ một lab được chạy. Khi trạng thái là UNKNOWN, console cố ý không cho force retry hoặc reconcile.</p>
+    </section>
+
+    <section id="credentials" aria-labelledby="credentials-heading">
+      <h2 id="credentials-heading">Token kiểm thử của lab đang chạy</h2>
+      <p class="warning">Token được chuẩn bị tự động cho lab hiện tại nhưng chỉ được ký và giữ tạm trong tab này khi bạn chủ động Hiện hoặc Sao chép. Hãy dùng kênh được phê duyệt và xóa clipboard sau khi dùng.</p>
+      <table>
+        <thead><tr><th>Tài khoản</th><th>Role</th><th>Cấp lúc</th><th>Hết hạn</th><th>Trạng thái</th><th>Token</th><th>Thao tác</th></tr></thead>
+        <tbody id="credential-list"><tr><td colspan="7">Đang tải…</td></tr></tbody>
+      </table>
+      <h3>Lịch sử token</h3>
+      <ul id="credential-audit"><li>Đang tải…</li></ul>
+    </section>
+    {% endif %}
+
+    {% if role == "evaluator" %}
+    <section aria-labelledby="lease-heading">
+      <h2 id="lease-heading">Evaluation lease</h2>
+      <form id="lease-form">
+        <label>Thời lượng (giây) <input id="lease-duration" type="number" min="60" max="3600" value="300" required></label>
+        <button type="submit">Acquire lease</button>
+      </form>
+      <p id="lease">Chưa có lease trong tab này.</p>
+      <div class="actions">
+        <button id="renew-lease" disabled>Renew</button>
+        <button id="release-lease" disabled>Release</button>
+      </div>
+      <p class="warning">Lease hết hạn không tự release và không chứng minh evaluation đã dừng. Chỉ release sau khi hoàn tất.</p>
+    </section>
+    {% endif %}
+  </main>
+  <script src="/management/console/static/management_console.js" defer></script>
+</body>
+</html>

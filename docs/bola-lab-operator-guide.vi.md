@@ -1,0 +1,288 @@
+# Hướng dẫn vận hành Controlled BOLA Lab
+
+Tài liệu này dành cho **operator trên Machine B** và người chạy tool đánh giá trên **Machine A**. Lab là service Flask độc lập, chỉ phục vụ thực nghiệm Broken Object Level Authorization (BOLA); nó không thay đổi, không dùng chung database và không thay thế VAmPI gốc.
+
+Xem thêm [hướng dẫn kỹ thuật và triển khai](bola-lab.md) và [OpenAPI public](../openapi_specs/bola-lab.openapi.json).
+
+## 1. Mô hình bảo mật và phạm vi
+
+- **Machine B** giữ controller, SQLite/credential registry, manifest signing secret, marker và answer sheet private.
+- **Machine A** chỉ nhận base URL, OpenAPI public, token được operator mTLS cấp qua kênh bảo vệ và policy/pointer được phép cung cấp.
+- Public API chỉ có `GET /health`, `GET /me` và `GET /books/{book_id}`.
+- Không có API public để đăng ký user, login, tạo/sửa/xóa book, reset lab, chọn scenario hoặc lấy answer sheet.
+- Không gọi `/createdb`: đó là endpoint của VAmPI gốc, không thuộc BOLA Lab.
+
+> Không commit, in log, gửi qua chat hoặc đưa vào tool Machine A `active-run.json`, `answer-sheet.json`, `operator-config.json`, `lab.sqlite3` hay `server.lock`. Không export hoặc lưu bearer token trong file/script/history; chỉ chuyển từng token cần thiết qua protected channel đã phê duyệt.
+
+## 2. Cài đặt môi trường BOLA Lab
+
+Dùng dependency riêng của lab. Không cài `requirements.txt` của VAmPI vào virtual environment này.
+
+```bash
+python3 -m venv .venv-bola-lab
+```
+
+```bash
+. .venv-bola-lab/bin/activate && python -m pip install -r requirements.bola-lab.txt
+```
+
+## 3. Tạo dữ liệu ban đầu và user
+
+User **không được tạo bằng HTTP API**. Controller cục bộ tạo sẵn toàn bộ dữ liệu cho mỗi run:
+
+| Principal | Role | Mục đích |
+| --- | --- | --- |
+| `admin` | `admin` | Control cho phép đo S11; policy mặc định là `UNKNOWN` ngoài control này. |
+| `userA` | `user` | Requester chính trong các phép thử cross-owner. |
+| `userB` | `user` | Owner của resource mục tiêu `book-B1`/`book-B2`. |
+
+| Resource | Owner | Title |
+| --- | --- | --- |
+| `book-A1` | `userA` | User A book one |
+| `book-A2` | `userA` | User A book two |
+| `book-B1` | `userB` | User B book one |
+| `book-B2` | `userB` | User B book two |
+
+Tạo thư mục state chỉ operator được đọc:
+
+```bash
+mkdir -m 700 bola-lab-state
+```
+
+Management console mTLS thực hiện toàn bộ lifecycle **Start, Reset, Stop**. Start đầu tiên tự tạo và validate SQLite, users, books, share, marker, manifest, answer sheet và registry credential; không cần chạy `init` hoặc `validate` thủ công. Controller local chỉ là công cụ break-glass/host maintenance, không phải workflow console thông thường.
+
+Mỗi Start đầu tiên hoặc Reset tạo private artifact owner-only (`0700` cho thư mục, `0600` cho file): `lab.sqlite3` (database và registry claims), `operator-config.json` (pointer, identity/resource và policy), `active-run.json` (manifest) và `answer-sheet.json` (ground truth). Không in bearer token, signing secret, marker, run ID hoặc nội dung answer sheet. Reset tạo manifest/registry mới nên token và marker cũ không còn hợp lệ.
+
+### Xem account và cấp token qua management console
+
+BOLA Lab không dùng password authentication. Mỗi principal chỉ có `username`/`role`; lệnh local chỉ xem danh sách account và **không có** subcommand xuất token:
+
+```bash
+python -m bola_lab.operator_accounts --state-dir "$PWD/bola-lab-state" list
+```
+
+Sau Start, đăng nhập management console qua mTLS với principal được role-map là `operator`. Start/Reset tự provision metadata cho đúng ba token (`admin`, `userA`, `userB`); chỉ role này được mở **Token kiểm thử** để chủ động **Hiện** hoặc **Sao chép** từng giá trị của lab đang chạy. CA trust đơn thuần, `reader`, `evaluator` và BOLA bearer không đủ quyền. Token chỉ tồn tại tạm trong memory tab sau response `Cache-Control: no-store`; không xuất hiện trong URL, Operation/audit, log hay local/session/IndexedDB storage. Xóa clipboard sau khi chuyển token qua protected channel.
+
+`UNKNOWN` chặn mọi lifecycle/reveal cho đến khi đối soát ngoài băng. Stop tự thu hồi token active trước khi dừng service; Reset tạo generation mới. Không có manual issue/reissue/revoke action trong console.
+
+### Token
+
+Khi test thủ công, dùng placeholder sau và thay bằng token được operator cấp; không ghi giá trị token vào shell history, script, commit hoặc log:
+
+```bash
+export USER_A_TOKEN='<bearer-token-received-securely>'
+```
+
+Khi kết thúc:
+
+```bash
+unset USER_A_TOKEN
+```
+
+## 4. Khởi động và dừng service
+
+Sau `init`/`validate`, chạy service ở Machine B:
+
+```bash
+BOLA_LAB_STATE_DIR="$PWD/bola-lab-state" BOLA_LAB_HOST=127.0.0.1 BOLA_LAB_PORT=5003 python bola_lab_app.py
+```
+
+Mặc định launcher chỉ bind `127.0.0.1`; Machine A trên LAN không thể kết nối khi operator chưa cấu hình rõ ràng. Không thay scenario khi process đang chạy. Dừng process bằng `Ctrl+C` trước khi reset.
+
+### Mở có kiểm soát cho nhiều client LAN
+
+Firewall trên **Machine B** là lớp chặn chính; application allowlist chỉ là defense in depth. Chỉ mở một địa chỉ LAN cụ thể của Machine B và chỉ khai báo các IP/CIDR client cần thiết. `BOLA_LAB_ALLOWED_CLIENTS` nhận danh sách phân tách bằng dấu phẩy gồm IPv4, IPv6, `/32`/`/128` host hoặc CIDR hẹp (IPv4 tối thiểu `/24`, IPv6 tối thiểu `/64`). Biến không được khai báo nghĩa là chỉ loopback; giá trị rỗng, wildcard, malformed, duplicate hoặc mạng quá rộng làm service từ chối khởi động.
+
+Ví dụ với Machine B `192.168.10.10`, Machine A `192.168.10.20` và Machine C `192.168.10.21`:
+
+```bash
+BOLA_LAB_STATE_DIR="$PWD/bola-lab-state" BOLA_LAB_HOST=192.168.10.10 BOLA_LAB_PORT=5003 BOLA_LAB_ALLOWED_CLIENTS="192.168.10.20,192.168.10.21,2001:db8:10::20" python bola_lab_app.py
+```
+
+Không dùng `0.0.0.0` hoặc `::` cho direct process. Allowlist luôn giữ loopback cho operator local và kiểm tra duy nhất địa chỉ TCP peer (`request.remote_addr`) trước `/health`, authentication và scenario routing; nó bỏ qua hoàn toàn `Forwarded`, `X-Forwarded-For` và `X-Real-IP`. Mọi client **LAN** ngoài allowlist luôn nhận neutral `404 {"error":"not_found"}`; response không tiết lộ token, state hoặc scenario.
+
+Cấu hình firewall bằng backend thực tế của Machine B để chỉ cho phép các IP đó tới **đúng địa chỉ/port publish**. Không coi một UFW `INPUT` rule đơn thuần là đủ với Docker Engine: Docker có thể xử lý published port qua NAT/FORWARD chain. Xác minh rule thực tế trên host bằng một client được phép và một client bị từ chối; không tự động thêm rule firewall từ lab.
+
+### Docker và giới hạn nguồn IP
+
+Compose mặc định publish `127.0.0.1:5003`, không mở LAN. Khi dùng Docker cho LAN, operator phải đặt rõ `BOLA_LAB_PUBLISH_ADDRESS` bằng địa chỉ LAN của Machine B và export `BOLA_LAB_ALLOWED_CLIENTS` trước `docker compose`; container vẫn bind `0.0.0.0` nội bộ để Docker forward port:
+
+```bash
+export BOLA_LAB_PUBLISH_ADDRESS=192.168.10.10
+```
+
+```bash
+export BOLA_LAB_ALLOWED_CLIENTS="192.168.10.20,192.168.10.21"
+```
+
+Không giả định Docker bridge, Docker Desktop, reverse proxy hoặc NAT giữ nguyên client source IP. Không allow Docker gateway thay cho allowlist client và không bật trust forwarding headers như một workaround. Nếu runtime thực tế làm `request.remote_addr` thành gateway/proxy address, application allowlist không thể chứng minh danh tính Machine A: giữ publish loopback hoặc chạy direct process trên Machine B với firewall/L3 path bảo toàn source IP, cho đến khi thiết kế một trusted-proxy boundary riêng. Thử Docker từ ít nhất hai host LAN và kiểm tra IPv6/direct-routing trước khi ghi nhận isolation PASS.
+
+
+Kiểm tra readiness từ một terminal khác:
+
+```bash
+curl -sS http://127.0.0.1:5003/health
+```
+
+Response trung tính:
+
+```json
+{"status":"ready"}
+```
+
+## 5. Public API
+
+| API | Auth | Mục đích | Pointer ổn định |
+| --- | --- | --- | --- |
+| `GET /health` | Không | Kiểm tra readiness | Không có dữ liệu scenario |
+| `GET /me` | Bearer | Xác nhận principal hiện tại | `/principal/username` |
+| `GET /books/{book_id}` | Bearer | Đọc một resource để đánh giá authorization | `/data/id`, `/data/secret` |
+
+### `GET /me`
+
+```bash
+curl -sS -H "Authorization: Bearer $USER_A_TOKEN" http://127.0.0.1:5003/me
+```
+
+Ví dụ response:
+
+```json
+{"principal":{"role":"user","username":"userA"}}
+```
+
+### `GET /books/{book_id}`
+
+```bash
+curl -i -sS -H "Authorization: Bearer $USER_A_TOKEN" http://127.0.0.1:5003/books/book-B1
+```
+
+Form resource đầy đủ, khi scenario/policy cho phép trả private data:
+
+```json
+{
+  "data": {
+    "id": "book-B1",
+    "owner": "userB",
+    "title": "User B book one",
+    "secret": "<generated-private-marker>"
+  }
+}
+```
+
+`401` luôn là `{"error":"unauthorized"}` khi thiếu, sai hoặc hết hạn token. `404` luôn là `{"error":"not_found"}` khi resource/path không tồn tại. Không suy luận authorization chỉ từ `200` hoặc `403`; phải đánh giá body, identity trả về và policy được cấp.
+
+## 6. Quy trình chạy test case thủ công
+
+Mỗi run chỉ dùng một scenario. Quy trình chuẩn trên management console:
+
+1. Bấm **Start lab**, chọn scenario và TTL cho run đầu tiên.
+2. Console tự provision/validate state và chạy service.
+3. Operator mTLS mở **Token kiểm thử**, hiện/sao chép token cho role cần thiết qua protected channel; dùng `userB` làm owner control khi cần.
+4. Bấm **Stop lab** khi hoàn tất; token active bị thu hồi trước khi service dừng.
+5. Khi đổi scenario, bấm **Reset lab**, chọn scenario/TTL, rồi bấm **Start lab** để chạy replacement đã được validate.
+
+Sau Reset, token và marker cũ không còn hợp lệ; chỉ dùng token mới được reveal từ lab đang chạy.
+
+## 7. Danh sách S01–S12
+
+Bảng này mô tả **evidence cần quan sát** khi `userA` yêu cầu `book-B1`, trừ khi ghi khác. Answer sheet private là authority cuối cùng để chấm; không suy luận policy từ hành vi server.
+
+| Case | Quan sát chính | Kết luận/cảnh báo |
+| --- | --- | --- |
+| S01 | `200`, `data.id=book-B1`, có private `secret` của `userB` | BOLA được xác nhận. |
+| S02 | `200`, denial envelope, không có private secret | Không coi `200` là evidence của BOLA. |
+| S03 | `403` nhưng body vẫn có `book-B1` và private secret | BOLA được xác nhận từ body; `403` không làm disclosure an toàn. |
+| S04 | `403`, denial envelope, không có private data | Denial control; cần policy/owner control để kết luận policy-consistent. |
+| S05 | `200`, `data: null` | Không có disclosure; `INSUFFICIENT_EVIDENCE` được chấp nhận. |
+| S06 | `200`, public fields, `secret: "***"` | Mask không phải private marker. |
+| S07 | `200` nhưng trả đúng `book-A1` của requester | Không tính là lộ target `book-B1`; kiểm tra `/data/id`. |
+| S08 | `200`, `book-B1` được trả cho `userA` | Cross-owner hợp lệ vì B1 được share cho A. |
+| S09 | `200`, chỉ có `id`, `owner`, `title` | Different owner không tự tạo BOLA khi chỉ public fields xuất hiện. |
+| S10 | B1/B2 dùng marker trùng; B2 thiếu `/data/id` | Nếu không chứng minh được marker thuộc target B2, `INSUFFICIENT_EVIDENCE` là chấp nhận được. |
+| S11 | Response leak của `userA` và denial control của `admin` có byte length bằng nhau | Không dùng response length là rule quyết định. |
+| S12 | `202`, body form thay đổi nhưng có target private data | Status/format khác không phủ định disclosure. |
+
+### Request bổ sung cho S10
+
+Khi scenario là S10, dùng cùng token `userA` để đọc cả hai resource:
+
+```bash
+curl -sS -H "Authorization: Bearer $USER_A_TOKEN" http://127.0.0.1:5003/books/book-B1
+```
+
+```bash
+curl -sS -H "Authorization: Bearer $USER_A_TOKEN" http://127.0.0.1:5003/books/book-B2
+```
+
+Không tự gán marker trả về ở B2 cho B2 nếu `/data/id` bị thiếu. Đây là thử nghiệm attribution ambiguity, không phải lỗi format cần sửa.
+
+### Owner control
+
+Operator cấp token `userB` qua kênh bảo vệ; owner luôn nhận full resource của `book-B1` trong mọi scenario. Đây là control tách biệt với hành vi cross-owner.
+
+## 8. Automated verification
+
+Sau khi activate `.venv-bola-lab`, chạy:
+
+```bash
+python -m compileall -q bola_lab bola_lab_app.py tests
+```
+
+```bash
+python -W error::ResourceWarning -m unittest discover -s tests -v
+```
+
+Không coi kết quả test lịch sử là acceptance hiện tại. Chạy các lệnh trên trong environment BOLA trước mỗi thay đổi; suite cover S01–S12, token invalid/expired/revoked, owner control, private-path isolation, reset isolation và lifecycle/console management. Nghiệm thu mTLS thật, proxy header stripping, firewall/Docker/NAT/IPv6 và log policy vẫn phải thực hiện trên deployment.
+
+Các test tạo state tạm và tự cleanup. Test PASS không tạo một dataset bền vững để chạy thủ công; dùng controller `init` khi cần state bền vững.
+
+## 9. Docker Compose cô lập
+
+Docker image dùng Python 3.11 và dependency BOLA Lab riêng, không phụ thuộc Python/virtual environment của host. Dùng project, port loopback và volume riêng để không tác động container hay volume VAmPI khác:
+
+```bash
+export BOLA_LAB_PUBLISH_ADDRESS=127.0.0.1
+```
+
+```bash
+export BOLA_LAB_PUBLISH_PORT=5503
+```
+
+```bash
+export BOLA_LAB_VOLUME_NAME=vampi-bola-acceptance-state
+```
+
+```bash
+docker compose -p vampi-bola-acceptance -f docker-compose.lab.yaml build bola-lab
+```
+
+Khởi tạo private state S01 trong **volume acceptance**:
+
+```bash
+docker compose -p vampi-bola-acceptance -f docker-compose.lab.yaml run --rm --no-deps bola-lab python -m bola_lab.controller --state-dir /var/lib/bola-lab --scenario S01 --token-ttl 3600 init
+```
+
+Chỉ chạy service BOLA Lab:
+
+```bash
+docker compose -p vampi-bola-acceptance -f docker-compose.lab.yaml up -d --no-build bola-lab
+```
+
+```bash
+curl -sS http://127.0.0.1:5503/health
+```
+
+Dừng service nhưng giữ volume và private data:
+
+```bash
+docker compose -p vampi-bola-acceptance -f docker-compose.lab.yaml stop bola-lab
+```
+
+Không chạy `docker compose down -v`, không prune volume và không tác động đến các service upstream VAmPI.
+
+## 10. Sau một lượt đánh giá
+
+1. Bấm **Stop lab** trên management console Machine B.
+2. Operator xem answer sheet private cục bộ và so sánh với output tool.
+3. Không gọi lại tool để tạo đáp án.
+4. Khi bắt đầu lượt mới, dùng **Reset lab** sau khi Stop, rồi **Start lab** và reveal token mới khi run đã chạy.
