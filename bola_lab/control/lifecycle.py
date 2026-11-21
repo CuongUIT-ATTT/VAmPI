@@ -54,6 +54,20 @@ class RunLifecycle:
         if not self._valid_manifest():
             raise LifecycleError("Lab state validation failed.")
 
+    def provision(self, scenario: str, ttl: int) -> None:
+        """Create and validate one fresh private run while its service is stopped."""
+        if scenario not in SCENARIO_IDS or not 300 <= ttl <= 86400:
+            raise LifecycleError("Requested scenario or token lifetime is invalid.")
+        if self.supervisor.status() not in {"inactive", "failed"}:
+            raise LifecycleError("Lab service state is not safely stopped.")
+        try:
+            reset_run(self.state_dir, scenario, ttl)
+            validate_run(self.state_dir)
+        except StateError as exc:
+            raise LifecycleError("Lab state could not be provisioned safely.") from exc
+        if not self._valid_manifest():
+            raise LifecycleError("Lab state could not be provisioned safely.")
+
     def start(self) -> None:
         if not self._valid_manifest():
             raise LifecycleError("Lab credentials are unavailable.")
@@ -79,6 +93,19 @@ class RunLifecycle:
         if status == "active":
             raise LifecycleError("Lab service did not become inactive.")
         raise IndeterminateLifecycleError("Lab service outcome is unknown.")
+
+    def reset_and_start(self, scenario: str, ttl: int) -> None:
+        """Replace the sole lab run and return it to a known running state."""
+        was_running = self.supervisor.status() == "active"
+        if was_running:
+            self.stop()
+        try:
+            self.provision(scenario, ttl)
+            self.start()
+        except LifecycleError as exc:
+            if was_running:
+                raise IndeterminateLifecycleError("Lab reset outcome is unknown.") from exc
+            raise
 
     def reset(self, scenario: str, ttl: int) -> None:
         if scenario not in SCENARIO_IDS or not 300 <= ttl <= 86400:

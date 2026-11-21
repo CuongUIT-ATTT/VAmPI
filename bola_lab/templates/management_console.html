@@ -33,40 +33,30 @@
     {% if role == "operator" %}
     <section aria-labelledby="lifecycle-heading">
       <h2 id="lifecycle-heading">Vòng đời lab</h2>
-      <form id="init-form">
+      <form id="start-form">
         <label>Scenario <select id="scenario" name="scenario" required></select></label>
         <label>Token TTL (giây) <input id="token-ttl" name="token_ttl_seconds" type="number" min="300" max="86400" value="3600" required></label>
-        <button type="submit">Khởi tạo</button>
+        <button type="submit" data-lifecycle="start">Start lab</button>
       </form>
-      <div class="actions">
-        <button data-lifecycle="validate">Validate</button>
-        <button data-lifecycle="start">Start</button>
-        <button data-lifecycle="stop">Stop</button>
-      </div>
       <form id="reset-form">
         <label>Scenario <select id="reset-scenario" name="scenario" required></select></label>
         <label>Token TTL (giây) <input id="reset-token-ttl" name="token_ttl_seconds" type="number" min="300" max="86400" value="3600" required></label>
         <label class="confirm"><input id="reset-confirm" type="checkbox" required> Tôi hiểu reset sẽ vô hiệu hoá token và marker hiện tại.</label>
-        <button type="submit" class="danger">Reset và vô hiệu hoá token</button>
+        <button type="submit" class="danger" data-lifecycle="reset">Reset lab</button>
       </form>
-      <p class="warning">Khi trạng thái là UNKNOWN, console cố ý không cho force retry hoặc reconcile. Thực hiện đối soát ngoài băng theo tài liệu vận hành.</p>
+      <div class="actions">
+        <button data-lifecycle="stop" class="danger">Stop lab</button>
+      </div>
+      <p class="warning">Start và Reset tự tạo users, books, share, markers, credential registry rồi validate nội bộ. Mỗi thời điểm chỉ một lab được chạy. Khi trạng thái là UNKNOWN, console cố ý không cho force retry hoặc reconcile.</p>
     </section>
 
     <section id="credentials" aria-labelledby="credentials-heading">
-      <h2 id="credentials-heading">Token kiểm thử</h2>
-      <p class="warning">Token chỉ được giữ tạm trong tab này khi bạn chủ động Hiện hoặc Cấp. Hãy dùng kênh được phê duyệt và xóa clipboard sau khi dùng.</p>
-      <form id="credential-issue-form">
-        <label>Token TTL (giây) <input id="credential-ttl" type="number" min="300" max="86400" value="3600" required></label>
-        <button type="submit" id="credential-issue">Cấp token cho ba role</button>
-      </form>
+      <h2 id="credentials-heading">Token kiểm thử của lab đang chạy</h2>
+      <p class="warning">Token được chuẩn bị tự động cho lab hiện tại nhưng chỉ được ký và giữ tạm trong tab này khi bạn chủ động Hiện hoặc Sao chép. Hãy dùng kênh được phê duyệt và xóa clipboard sau khi dùng.</p>
       <table>
         <thead><tr><th>Tài khoản</th><th>Role</th><th>Cấp lúc</th><th>Hết hạn</th><th>Trạng thái</th><th>Token</th><th>Thao tác</th></tr></thead>
         <tbody id="credential-list"><tr><td colspan="7">Đang tải…</td></tr></tbody>
       </table>
-      <form id="credential-revoke-form">
-        <label class="confirm"><input id="credential-revoke-confirm" type="checkbox" required> Tôi hiểu mọi token hiện tại sẽ bị từ chối ngay.</label>
-        <button type="submit" class="danger" id="credential-revoke">Thu hồi toàn bộ token</button>
-      </form>
       <h3>Lịch sử token</h3>
       <ul id="credential-audit"><li>Đang tải…</li></ul>
     </section>

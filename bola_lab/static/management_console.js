@@ -13,6 +13,7 @@
   let refreshTimer = null;
   let credentialClearTimer = null;
   let credentialRows = [];
+  let credentialGeneration = null;
 
   const setNotice = (message, level = "") => { notice.textContent = message; notice.dataset.level = level; };
   const randomKey = () => crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "");
@@ -50,16 +51,24 @@
       ["Credential generation", value.credential_generation], ["Active leases", value.evaluation_leases.active], ["Expired unreleased leases", value.evaluation_leases.expired_unreleased],
     ];
     fields.forEach(([label, item]) => { const dt = document.createElement("dt"); const dd = document.createElement("dd"); dt.textContent = label; dd.textContent = item; statusNode.append(dt, dd); });
-    document.querySelectorAll("[data-lifecycle]").forEach((button) => { button.disabled = value.lifecycle === "UNKNOWN"; });
+    if (credentialGeneration !== null && credentialGeneration !== value.credential_generation) { clearCredentialMemory(); }
+    credentialGeneration = value.credential_generation;
+    const blockedByLease = value.evaluation_leases.active > 0 || value.evaluation_leases.expired_unreleased > 0;
+    const start = document.querySelector('[data-lifecycle="start"]');
+    if (start) { start.disabled = !["UNINITIALIZED", "READY"].includes(value.lifecycle) || blockedByLease; }
     const stop = document.querySelector('[data-lifecycle="stop"]');
-    if (stop) { stop.disabled = value.lifecycle === "UNKNOWN" || value.evaluation_leases.active > 0 || value.evaluation_leases.expired_unreleased > 0; }
-    const reset = document.querySelector("#reset-form button");
-    if (reset) { reset.disabled = value.lifecycle !== "STOPPED" || value.evaluation_leases.active > 0 || value.evaluation_leases.expired_unreleased > 0; }
-    const issue = document.querySelector("#credential-issue");
-    if (issue) { issue.disabled = value.lifecycle === "UNKNOWN"; }
-    document.querySelectorAll("[data-reissue]").forEach((button) => { button.disabled = value.lifecycle === "UNKNOWN" || button.dataset.eligible !== "true"; });
+    if (stop) { stop.disabled = value.lifecycle !== "RUNNING" || blockedByLease; }
+    const reset = document.querySelector('[data-lifecycle="reset"]');
+    if (reset) { reset.disabled = value.lifecycle !== "STOPPED" || blockedByLease; }
+    const startForm = document.querySelector("#start-form");
+    if (startForm) { startForm.hidden = !["UNINITIALIZED", "READY"].includes(value.lifecycle); }
+    const resetForm = document.querySelector("#reset-form");
+    if (resetForm) { resetForm.hidden = value.lifecycle !== "STOPPED"; }
+    document.querySelectorAll("[data-reissue]").forEach((button) => { button.disabled = true; });
+    if (value.lifecycle !== "RUNNING") { clearCredentialMemory(); }
   };
   const refreshStatus = async () => { const { payload } = await managementFetch("/management/v1/status"); renderStatus(payload); };
+  const refreshLiveState = async () => { await Promise.all([refreshStatus(), refreshCredentials(), refreshCredentialAudit()]); };
   const renderOperation = (item) => { operationNode.textContent = `${item.operation_id}: ${item.state}${item.result_code ? ` (${item.result_code})` : ""}`; };
   const pollOperation = async (location) => {
     for (let wait = 500; wait <= 5000; wait = Math.min(wait * 2, 5000)) {
@@ -103,9 +112,7 @@
       reveal.addEventListener("click", () => revealCredential(credential.username).catch((error) => setNotice(error.message, "error")));
       const copy = document.createElement("button"); copy.type = "button"; copy.textContent = "Sao chép"; copy.disabled = credential.status !== "ACTIVE";
       copy.addEventListener("click", () => copyCredential(credential.username).catch((error) => setNotice(error.message, "error")));
-      const reissue = document.createElement("button"); reissue.type = "button"; reissue.textContent = "Cấp lại"; reissue.dataset.reissue = credential.username; reissue.dataset.eligible = String(["EXPIRED", "REVOKED"].includes(credential.status)); reissue.disabled = reissue.dataset.eligible !== "true" || (status && status.lifecycle === "UNKNOWN");
-      reissue.addEventListener("click", () => reissueCredential(credential.username).catch((error) => setNotice(error.message, "error")));
-      actions.append(reveal, copy, reissue); row.append(actions); list.append(row);
+      actions.append(reveal, copy); row.append(actions); list.append(row);
     });
   };
   const refreshCredentials = async () => {
@@ -153,44 +160,22 @@
     await mutation(`/management/v1/credentials/${encodeURIComponent(subject)}/copy-audit`, {});
     setNotice("Đã sao chép token. Hãy xóa clipboard sau khi hoàn tất.", "success"); await refreshCredentialAudit();
   };
-  const issueCredentials = async () => {
-    if (!status) { await refreshStatus(); }
-    const ttl = Number(document.querySelector("#credential-ttl").value);
-    const { payload } = await mutation("/management/v1/credentials/issue", { token_ttl_seconds: ttl }, { headers: { "Idempotency-Key": randomKey(), "If-Match": status.state_version } });
-    payload.credentials.forEach(rememberCredential); await Promise.all([refreshCredentials(), refreshCredentialAudit(), refreshStatus()]);
-    setNotice("Đã cấp token cho admin, userA và userB. Giá trị đang được che.", "success");
-  };
-  const reissueCredential = async (subject) => {
-    if (!status) { await refreshStatus(); }
-    const ttl = Number(document.querySelector("#credential-ttl").value);
-    const { payload } = await mutation(`/management/v1/credentials/${encodeURIComponent(subject)}/reissue`, { token_ttl_seconds: ttl, confirm_invalidate_previous: true }, { headers: { "Idempotency-Key": randomKey(), "If-Match": status.state_version } });
-    credentialMemory.delete(subject); revealedCredentials.delete(subject); rememberCredential(payload.credential); await Promise.all([refreshCredentials(), refreshCredentialAudit(), refreshStatus()]);
-    setNotice(`Đã cấp lại token ${subject}; token trước đó đã không còn hiệu lực.`, "success");
-  };
-  const revokeCredentials = async () => {
-    if (!status) { await refreshStatus(); }
-    await mutation("/management/v1/credentials/revoke-all", { confirm_revoke_all: true }, { headers: { "Idempotency-Key": randomKey(), "If-Match": status.state_version } });
-    clearCredentialMemory(); await Promise.all([refreshCredentials(), refreshCredentialAudit(), refreshStatus()]);
-    setNotice("Đã thu hồi toàn bộ token hiện tại.", "success");
-  };
-  document.querySelectorAll("[data-lifecycle]").forEach((button) => button.addEventListener("click", () => lifecycle(button.dataset.lifecycle, {}).catch((error) => { setNotice(error.message, "error"); refreshStatus().catch(() => {}); })));
-  const initForm = document.querySelector("#init-form");
-  if (initForm) { initForm.addEventListener("submit", (event) => { event.preventDefault(); lifecycle("init", { scenario: document.querySelector("#scenario").value, token_ttl_seconds: Number(document.querySelector("#token-ttl").value) }).catch((error) => { setNotice(error.message, "error"); refreshStatus().catch(() => {}); }); }); }
+  const lifecycleFailure = (error) => { setNotice(error.message, "error"); refreshLiveState().catch(() => {}); };
+  const startForm = document.querySelector("#start-form");
+  if (startForm) { startForm.addEventListener("submit", (event) => { event.preventDefault(); const body = status && status.lifecycle === "READY" ? {} : { scenario: document.querySelector("#scenario").value, token_ttl_seconds: Number(document.querySelector("#token-ttl").value) }; lifecycle("start", body).then(refreshLiveState).catch(lifecycleFailure); }); }
+  const stop = document.querySelector('[data-lifecycle="stop"]');
+  if (stop) { stop.addEventListener("click", () => lifecycle("stop", {}).then(() => { clearCredentialMemory(); return refreshLiveState(); }).catch(lifecycleFailure)); }
   const resetForm = document.querySelector("#reset-form");
-  if (resetForm) { resetForm.addEventListener("submit", (event) => { event.preventDefault(); clearCredentialMemory(); lifecycle("reset", { scenario: document.querySelector("#reset-scenario").value, token_ttl_seconds: Number(document.querySelector("#reset-token-ttl").value), confirm_invalidate_tokens: true }).catch((error) => { setNotice(error.message, "error"); refreshStatus().catch(() => {}); }); }); }
-  const issueForm = document.querySelector("#credential-issue-form");
-  if (issueForm) { issueForm.addEventListener("submit", (event) => { event.preventDefault(); issueCredentials().catch((error) => { setNotice(error.message, "error"); refreshCredentials().catch(() => {}); }); }); }
-  const revokeForm = document.querySelector("#credential-revoke-form");
-  if (revokeForm) { revokeForm.addEventListener("submit", (event) => { event.preventDefault(); revokeCredentials().catch((error) => setNotice(error.message, "error")); }); }
+  if (resetForm) { resetForm.addEventListener("submit", (event) => { event.preventDefault(); lifecycle("reset", { scenario: document.querySelector("#reset-scenario").value, token_ttl_seconds: Number(document.querySelector("#reset-token-ttl").value), confirm_invalidate_tokens: true }).then(() => { clearCredentialMemory(); return refreshLiveState(); }).catch(lifecycleFailure); }); }
   const leaseForm = document.querySelector("#lease-form");
   if (leaseForm) { leaseForm.addEventListener("submit", async (event) => { event.preventDefault(); try { const { payload } = await mutation("/management/v1/evaluation-leases", { duration_seconds: Number(document.querySelector("#lease-duration").value) }); lease = payload; document.querySelector("#lease").textContent = `Lease expires at ${payload.expires_at}.`; document.querySelector("#renew-lease").disabled = false; document.querySelector("#release-lease").disabled = false; await refreshStatus(); } catch (error) { setNotice(error.message, "error"); } }); }
   const renew = document.querySelector("#renew-lease");
   if (renew) { renew.addEventListener("click", async () => { if (!lease) return; try { const { payload } = await mutation(`/management/v1/evaluation-leases/${encodeURIComponent(lease.lease_id)}/renew`, { duration_seconds: Number(document.querySelector("#lease-duration").value) }); lease = payload; document.querySelector("#lease").textContent = `Lease expires at ${payload.expires_at}.`; await refreshStatus(); } catch (error) { setNotice(error.message, "error"); } }); }
   const release = document.querySelector("#release-lease");
   if (release) { release.addEventListener("click", async () => { if (!lease) return; try { await managementFetch(`/management/v1/evaluation-leases/${encodeURIComponent(lease.lease_id)}`, { method: "DELETE", headers: { "X-Management-Console": "1", "X-CSRF-Token": csrfToken } }); lease = null; document.querySelector("#lease").textContent = "Lease released."; renew.disabled = true; release.disabled = true; await refreshStatus(); } catch (error) { setNotice(error.message, "error"); } }); }
-  const boot = async () => { try { await Promise.all([refreshStatus(), populateScenarios(), refreshCredentials(), refreshCredentialAudit()]); setNotice("Management console ready.", "success"); } catch (error) { setNotice(error.message, "error"); } };
+  const boot = async () => { try { await Promise.all([refreshLiveState(), populateScenarios()]); setNotice("Management console ready.", "success"); } catch (error) { setNotice(error.message, "error"); } };
   boot();
-  document.addEventListener("visibilitychange", () => { if (document.hidden) { window.clearInterval(refreshTimer); refreshTimer = null; } else if (!refreshTimer) { refreshStatus().catch(() => {}); refreshTimer = window.setInterval(() => refreshStatus().catch(() => {}), 10000); } });
+  document.addEventListener("visibilitychange", () => { if (document.hidden) { window.clearInterval(refreshTimer); refreshTimer = null; } else if (!refreshTimer) { refreshLiveState().catch(() => {}); refreshTimer = window.setInterval(() => refreshLiveState().catch(() => {}), 10000); } });
   window.addEventListener("pagehide", clearCredentialMemory);
-  refreshTimer = window.setInterval(() => refreshStatus().catch(() => {}), 10000);
+  refreshTimer = window.setInterval(() => refreshLiveState().catch(() => {}), 10000);
 })();

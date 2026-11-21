@@ -43,23 +43,15 @@ User **không được tạo bằng HTTP API**. Controller cục bộ tạo sẵ
 | `book-B1` | `userB` | User B book one |
 | `book-B2` | `userB` | User B book two |
 
-Tạo thư mục state chỉ operator được đọc và khởi tạo S01:
+Tạo thư mục state chỉ operator được đọc:
 
 ```bash
 mkdir -m 700 bola-lab-state
 ```
 
-```bash
-python -m bola_lab.controller --state-dir "$PWD/bola-lab-state" --scenario S01 --token-ttl 3600 init
-```
+Management console mTLS thực hiện toàn bộ lifecycle **Start, Reset, Stop**. Start đầu tiên tự tạo và validate SQLite, users, books, share, marker, manifest, answer sheet và registry credential; không cần chạy `init` hoặc `validate` thủ công. Controller local chỉ là công cụ break-glass/host maintenance, không phải workflow console thông thường.
 
-```bash
-python -m bola_lab.controller --state-dir "$PWD/bola-lab-state" validate
-```
-
-Controller tạo SQLite và các file owner-only (`0700` cho thư mục, `0600` cho file), manifest signing secret/credential registry trống và marker mới mỗi run. ID resource và authorization semantics vẫn ổn định.
-
-Sau `init` hoặc `reset`, controller chỉ in tóm tắt local-only về principal/resource và artifact private: `lab.sqlite3` (database và registry claims), `operator-config.json` (pointer, identity/resource và policy), `active-run.json` (manifest) và `answer-sheet.json` (ground truth). Tóm tắt **không** in bearer token, signing secret, marker, run ID hoặc nội dung answer sheet. Reset tạo manifest/registry mới nên token và marker cũ không còn hợp lệ.
+Mỗi Start đầu tiên hoặc Reset tạo private artifact owner-only (`0700` cho thư mục, `0600` cho file): `lab.sqlite3` (database và registry claims), `operator-config.json` (pointer, identity/resource và policy), `active-run.json` (manifest) và `answer-sheet.json` (ground truth). Không in bearer token, signing secret, marker, run ID hoặc nội dung answer sheet. Reset tạo manifest/registry mới nên token và marker cũ không còn hợp lệ.
 
 ### Xem account và cấp token qua management console
 
@@ -69,9 +61,9 @@ BOLA Lab không dùng password authentication. Mỗi principal chỉ có `userna
 python -m bola_lab.operator_accounts --state-dir "$PWD/bola-lab-state" list
 ```
 
-Sau `init → validate → start`, đăng nhập management console qua mTLS với principal được role-map là `operator`. Chỉ role này được mở **Token kiểm thử** để cấp đúng ba token (`admin`, `userA`, `userB`), chủ động **Hiện** hoặc **Sao chép** từng giá trị. CA trust đơn thuần, `reader`, `evaluator` và BOLA bearer không đủ quyền. Token chỉ tồn tại tạm trong memory tab sau response `Cache-Control: no-store`; không xuất hiện trong URL, Operation/audit, log hay local/session/IndexedDB storage. Xóa clipboard sau khi chuyển token qua protected channel.
+Sau Start, đăng nhập management console qua mTLS với principal được role-map là `operator`. Start/Reset tự provision metadata cho đúng ba token (`admin`, `userA`, `userB`); chỉ role này được mở **Token kiểm thử** để chủ động **Hiện** hoặc **Sao chép** từng giá trị của lab đang chạy. CA trust đơn thuần, `reader`, `evaluator` và BOLA bearer không đủ quyền. Token chỉ tồn tại tạm trong memory tab sau response `Cache-Control: no-store`; không xuất hiện trong URL, Operation/audit, log hay local/session/IndexedDB storage. Xóa clipboard sau khi chuyển token qua protected channel.
 
-`UNKNOWN` chặn issue/reissue cho đến khi đối soát ngoài băng; revoke-all vẫn được phép vì chỉ giảm quyền. Reissue chỉ khả dụng sau khi token trước đó `EXPIRED` hoặc `REVOKED`; không thay silent token active. Khi kết thúc test, thu hồi toàn bộ token trong console.
+`UNKNOWN` chặn mọi lifecycle/reveal cho đến khi đối soát ngoài băng. Stop tự thu hồi token active trước khi dừng service; Reset tạo generation mới. Không có manual issue/reissue/revoke action trong console.
 
 ### Token
 
@@ -181,26 +173,15 @@ Form resource đầy đủ, khi scenario/policy cho phép trả private data:
 
 ## 6. Quy trình chạy test case thủ công
 
-Mỗi run chỉ dùng một scenario. Quy trình chuẩn:
+Mỗi run chỉ dùng một scenario. Quy trình chuẩn trên management console:
 
-1. Dừng service hiện có.
-2. Khởi tạo lần đầu bằng `init`, hoặc thay scenario bằng `reset`.
-3. Chạy `validate`.
-4. Khởi động service mới.
-5. Operator mTLS mở **Token kiểm thử**, cấp/hiện/sao chép token cho role cần thiết qua protected channel; dùng `userB` làm owner control khi cần.
-6. Thu hồi toàn bộ token khi hoàn tất, rồi dừng service trước khi chuyển scenario tiếp theo.
+1. Bấm **Start lab**, chọn scenario và TTL cho run đầu tiên.
+2. Console tự provision/validate state và chạy service.
+3. Operator mTLS mở **Token kiểm thử**, hiện/sao chép token cho role cần thiết qua protected channel; dùng `userB` làm owner control khi cần.
+4. Bấm **Stop lab** khi hoàn tất; token active bị thu hồi trước khi service dừng.
+5. Khi đổi scenario, bấm **Reset lab**, chọn scenario/TTL, rồi bấm **Start lab** để chạy replacement đã được validate.
 
-Ví dụ chuyển sang S03:
-
-```bash
-python -m bola_lab.controller --state-dir "$PWD/bola-lab-state" --scenario S03 --token-ttl 3600 reset
-```
-
-```bash
-python -m bola_lab.controller --state-dir "$PWD/bola-lab-state" validate
-```
-
-Sau `reset`, token và marker cũ không còn hợp lệ; validate/start rồi luôn dùng token mới do operator mTLS cấp trong management console.
+Sau Reset, token và marker cũ không còn hợp lệ; chỉ dùng token mới được reveal từ lab đang chạy.
 
 ## 7. Danh sách S01–S12
 
@@ -301,7 +282,7 @@ Không chạy `docker compose down -v`, không prune volume và không tác đ�
 
 ## 10. Sau một lượt đánh giá
 
-1. Dừng service trên Machine B.
+1. Bấm **Stop lab** trên management console Machine B.
 2. Operator xem answer sheet private cục bộ và so sánh với output tool.
 3. Không gọi lại tool để tạo đáp án.
-4. Khi bắt đầu lượt mới, reset scenario sau khi service đã dừng, cấp token mới và khởi động process mới.
+4. Khi bắt đầu lượt mới, dùng **Reset lab** sau khi Stop, rồi **Start lab** và reveal token mới khi run đã chạy.

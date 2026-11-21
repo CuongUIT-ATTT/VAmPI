@@ -33,10 +33,8 @@ from .storage import (
     read_private_json,
     state_path,
     active_claims_for_subject,
-    claims_for_issuance,
     credential_statuses,
     issue_initial_credentials,
-    reissue_credential,
     revoke_all_credentials,
 )
 from .tokens import issue_token
@@ -303,63 +301,59 @@ def create_management_app(
             return denied
         return _response({"scenarios": [{"code": code, "description": item.description} for code, item in SCENARIOS.items()]})
 
-    @app.post("/management/v1/init")
-    def init() -> Response:
-        denied = require("operator")
-        if denied:
-            return denied
-        try:
-            body = _payload({"scenario", "token_ttl_seconds"})
-        except ValueError as exc:
-            return _error("invalid_request", str(exc), 422)
-        operation_id, error = mutating("init", body)
-        if error:
-            return error
-        return run_transition(
-            operation_id,
-            "init",
-            lambda: lifecycle.init(body["scenario"], body["token_ttl_seconds"]),
-            {"lifecycle": "STOPPED", "validated": False, "scenario": body["scenario"], "rotate_generation": True},
-        )
-
-    @app.post("/management/v1/validate")
-    def validate() -> Response:
-        denied = require("operator")
-        if denied:
-            return denied
-        try:
-            body = _payload(set())
-        except ValueError as exc:
-            return _error("invalid_request", str(exc), 422)
-        operation_id, error = mutating("validate", body)
-        if error:
-            return error
-        def validate_transition() -> None:
-            lifecycle.validate()
-            store.finish_operation(operation_id, "ok", lifecycle="STOPPED", validated=True, scenario=None)
-        try:
-            validate_transition()
-        except LifecycleError:
-            store.fail_operation(operation_id, "validation_failed")
-        return _response({"operation_id": operation_id}, 202, {"Location": f"/management/v1/operations/{operation_id}"})
-
     @app.post("/management/v1/start")
     def start() -> Response:
         denied = require("operator")
         if denied:
             return denied
         try:
-            body = _payload(set())
+            body = _payload(set(), {"scenario", "token_ttl_seconds"})
         except ValueError as exc:
             return _error("invalid_request", str(exc), 422)
-        def start_guard(_: Any, state: Any) -> None:
-            if not state["validated"]:
-                raise LeaseConflict("Lab state must be validated before start.")
+
+        start_state: str | None = None
+
+        def start_guard(connection: Any, state: Any) -> None:
+            nonlocal start_state
+            if state["lifecycle"] not in {"UNINITIALIZED", "READY"}:
+                raise LeaseConflict("Start requires an uninitialized or prepared lab.")
+            if state["lifecycle"] == "UNINITIALIZED":
+                if set(body) != {"scenario", "token_ttl_seconds"} or not isinstance(body["token_ttl_seconds"], int) or isinstance(body["token_ttl_seconds"], bool):
+                    raise LeaseConflict("Initial start requires a scenario and token lifetime.")
+            elif body:
+                raise LeaseConflict("A prepared lab starts without new configuration.")
+            store.require_no_unreleased_leases(connection, state)
+            start_state = state["lifecycle"]
 
         operation_id, error = mutating("start", body, start_guard)
         if error:
             return error
-        return run_transition(operation_id, "start", lifecycle.start, {"lifecycle": "RUNNING", "validated": True, "scenario": None})
+
+        def provision_and_start() -> None:
+            if start_state == "UNINITIALIZED":
+                lifecycle.provision(body["scenario"], body["token_ttl_seconds"])
+                try:
+                    claims = issue_initial_credentials(lifecycle.state_dir, body["token_ttl_seconds"], operation_id)
+                except StateError as exc:
+                    raise LifecycleError("Test credentials could not be provisioned safely.") from exc
+                for claim in claims:
+                    store.record_credential_audit(
+                        identity().subject,
+                        "issued",
+                        "ok",
+                        subject=claim["sub"],
+                        role=claim["role"],
+                    )
+            else:
+                lifecycle.validate()
+            lifecycle.start()
+
+        return run_transition(
+            operation_id,
+            "start",
+            provision_and_start,
+            {"lifecycle": "RUNNING", "validated": True, "scenario": body.get("scenario"), "rotate_generation": start_state == "UNINITIALIZED"},
+        )
 
     @app.post("/management/v1/stop")
     def stop() -> Response:
@@ -374,10 +368,17 @@ def create_management_app(
         if error:
             return error
         current = store.status()
+
+        def revoke_and_stop() -> None:
+            revoked = revoke_all_credentials(lifecycle.state_dir)
+            if revoked:
+                store.record_credential_audit(identity().subject, "revoked", "ok")
+            lifecycle.stop()
+
         return run_transition(
             operation_id,
             "stop",
-            lifecycle.stop,
+            revoke_and_stop,
             {"lifecycle": "STOPPED", "validated": current["validated"], "scenario": None},
         )
 
@@ -394,19 +395,38 @@ def create_management_app(
             return _error("invalid_request", "Token invalidation confirmation is required.", 422)
 
         def reset_guard(connection: Any, state: Any) -> None:
-            if state["lifecycle"] != "STOPPED":
+            if state["lifecycle"] not in {"UNINITIALIZED", "STOPPED"}:
                 raise LeaseConflict("Reset requires stopped state.")
             store.require_no_unreleased_leases(connection, state)
 
         operation_id, error = mutating("reset", body, reset_guard)
         if error:
             return error
+        def provision_reset() -> None:
+            lifecycle.provision(body["scenario"], body["token_ttl_seconds"])
+            try:
+                claims = issue_initial_credentials(lifecycle.state_dir, body["token_ttl_seconds"], operation_id)
+            except StateError as exc:
+                raise LifecycleError("Test credentials could not be provisioned safely.") from exc
+            for claim in claims:
+                store.record_credential_audit(
+                    identity().subject,
+                    "issued",
+                    "ok",
+                    subject=claim["sub"],
+                    role=claim["role"],
+                )
+
         return run_transition(
             operation_id,
             "reset",
-            lambda: lifecycle.reset(body["scenario"], body["token_ttl_seconds"]),
-            {"lifecycle": "STOPPED", "validated": False, "scenario": body["scenario"], "rotate_generation": True},
+            provision_reset,
+            {"lifecycle": "READY", "validated": True, "scenario": body["scenario"], "rotate_generation": True},
         )
+
+    def current_running_lab() -> None:
+        if store.status()["lifecycle"] != "RUNNING":
+            raise StateError("A running lab is required for test credentials.")
 
     @app.get("/management/v1/credentials")
     def credentials() -> Response:
@@ -414,112 +434,10 @@ def create_management_app(
         if denied:
             return denied
         try:
+            current_running_lab()
             return _response({"credentials": credential_statuses(lifecycle.state_dir)})
         except StateError:
-            return _error("service_unavailable", "Credential state is unavailable.", 503)
-
-    @app.post("/management/v1/credentials/issue")
-    def issue_credentials() -> Response:
-        denied = require("operator")
-        if denied:
-            return denied
-        try:
-            body = _payload({"token_ttl_seconds"})
-            if not isinstance(body["token_ttl_seconds"], int) or isinstance(body["token_ttl_seconds"], bool):
-                raise ValueError("Credential lifetime is invalid.")
-        except ValueError as exc:
-            return credential_error("issued", "invalid_request", 422, str(exc))
-        operation_id, error = mutating("credentials/issue", body)
-        if error:
-            if error.status_code != 202:
-                return error
-            try:
-                claims = claims_for_issuance(lifecycle.state_dir, operation_id)
-                if claims:
-                    return _response({"credentials": [signed_credential(item) for item in claims]}, 201)
-            except StateError:
-                pass
-            return error
-        try:
-            claims = claims_for_issuance(lifecycle.state_dir, operation_id)
-            if not claims:
-                claims = issue_initial_credentials(lifecycle.state_dir, body["token_ttl_seconds"], operation_id)
-                store.finish_operation(operation_id, "credentials_issued")
-                store.record_credential_audit(identity().subject, "issued", "ok")
-            return _response({"credentials": [signed_credential(item) for item in claims]}, 201)
-        except StateError as exc:
-            store.fail_operation(operation_id, "credential_issue_rejected")
-            return credential_error("issued", "rejected", 409, str(exc))
-
-    @app.post("/management/v1/credentials/<subject>/reissue")
-    def reissue_credentials(subject: str) -> Response:
-        denied = require("operator")
-        if denied:
-            return denied
-        try:
-            body = _payload({"token_ttl_seconds", "confirm_invalidate_previous"})
-            if body["confirm_invalidate_previous"] is not True:
-                raise ValueError("Previous-token invalidation confirmation is required.")
-            if not isinstance(body["token_ttl_seconds"], int) or isinstance(body["token_ttl_seconds"], bool):
-                raise ValueError("Credential lifetime is invalid.")
-        except ValueError as exc:
-            return credential_error("reissued", "invalid_request", 422, str(exc), subject=subject)
-        operation_id, error = mutating(f"credentials/{subject}/reissue", body)
-        if error:
-            if error.status_code != 202:
-                return error
-            try:
-                claims = claims_for_issuance(lifecycle.state_dir, operation_id)
-                if len(claims) == 1:
-                    payload = signed_credential(claims[0])
-                    payload.update({"previous_status": "REPLAYED", "previous_token_invalid": True})
-                    return _response({"credential": payload}, 201)
-            except StateError:
-                pass
-            return error
-        try:
-            claims = claims_for_issuance(lifecycle.state_dir, operation_id)
-            if claims:
-                current = claims[0]
-                previous_status = "REPLAYED"
-            else:
-                current, previous_status = reissue_credential(lifecycle.state_dir, subject, body["token_ttl_seconds"], operation_id)
-                store.finish_operation(operation_id, "credential_reissued")
-                store.record_credential_audit(identity().subject, "reissued", "ok", subject=subject, role=current["role"])
-            payload = signed_credential(current)
-            payload.update({"previous_status": previous_status, "previous_token_invalid": True})
-            return _response({"credential": payload}, 201)
-        except StateError as exc:
-            store.fail_operation(operation_id, "credential_reissue_rejected")
-            return credential_error("reissued", "rejected", 409, str(exc), subject=subject)
-
-    @app.post("/management/v1/credentials/revoke-all")
-    def revoke_credentials() -> Response:
-        denied = require("operator")
-        if denied:
-            return denied
-        try:
-            body = _payload({"confirm_revoke_all"})
-            if body["confirm_revoke_all"] is not True:
-                raise ValueError("Credential revocation confirmation is required.")
-        except ValueError as exc:
-            return credential_error("revoked", "invalid_request", 422, str(exc))
-        operation_id, error = mutating("credentials/revoke-all", body)
-        if error:
-            if error.status_code != 202:
-                return error
-            try:
-                return _response({"revoked": 0, "credentials": credential_statuses(lifecycle.state_dir)})
-            except StateError:
-                return error
-        try:
-            revoked = revoke_all_credentials(lifecycle.state_dir)
-            store.finish_operation(operation_id, "credentials_revoked")
-            store.record_credential_audit(identity().subject, "revoked", "ok")
-            return _response({"revoked": revoked, "credentials": credential_statuses(lifecycle.state_dir)})
-        except StateError as exc:
-            store.fail_operation(operation_id, "credential_revoke_rejected")
-            return credential_error("revoked", "rejected", 409, str(exc))
+            return _response({"credentials": []})
 
     @app.post("/management/v1/credentials/<subject>/reveal")
     def reveal_credential(subject: str) -> Response:
@@ -527,6 +445,7 @@ def create_management_app(
         if denied:
             return denied
         try:
+            current_running_lab()
             claims = active_claims_for_subject(lifecycle.state_dir, subject)
             store.record_credential_audit(identity().subject, "revealed", "ok", subject=subject, role=claims["role"])
             return _response({"credential": signed_credential(claims)})
@@ -539,6 +458,7 @@ def create_management_app(
         if denied:
             return denied
         try:
+            current_running_lab()
             claims = active_claims_for_subject(lifecycle.state_dir, subject)
             store.record_credential_audit(identity().subject, "copy_requested", "ok", subject=subject, role=claims["role"])
             return Response(status=204)
@@ -597,6 +517,10 @@ def create_management_app(
         if not store.release_lease(identity().subject, lease_id):
             return _error("not_found", "Evaluation lease was not found.", 404)
         return Response(status=204)
+
+    @app.errorhandler(404)
+    def not_found(_: Exception) -> Response:
+        return _error("not_found", "Management route was not found.", 404)
 
     @app.errorhandler(Exception)
     def unhandled(_: Exception) -> Response:

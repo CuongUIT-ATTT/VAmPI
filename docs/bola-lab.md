@@ -19,6 +19,8 @@ Lab chỉ public các route sau:
 
 Public specification là [`openapi_specs/bola-lab.openapi.json`](../openapi_specs/bola-lab.openapi.json). Nó không đổi giữa các scenario và cố ý không chứa tên scenario, marker, ground truth, token, controller route hoặc reset function.
 
+Vòng đời operator là **Start → evaluate → Stop → Reset (khi cần run mới) → Start**. Start đầu tiên tự tạo và validate private users, books, shares, markers, manifest, answer sheet và credential registry cho một scenario. Reset chỉ chuẩn bị replacement từ trạng thái stopped; run mới chỉ public sau Start. Tại mọi thời điểm chỉ fixed service/state directory đó có thể là lab RUNNING, còn credential metadata trong console được refresh theo generation của run hiện tại.
+
 Dạng book thông thường:
 
 ```json
@@ -74,7 +76,7 @@ BOLA Lab không có password authentication cho principal. Operator có thể xe
 python -m bola_lab.operator_accounts --state-dir "$PWD/bola-lab-state" list
 ```
 
-Lệnh local không thể in token. Sau `init → validate → start`, operator dùng console quản trị mTLS để cấp đúng ba token, chủ động hiện/sao chép từng token rồi chuyển qua kênh được phê duyệt. Response bearer là `no-store`; token không nằm trong URL, audit/Operation hay browser storage bền vững. Xem [Management API](bola-lab-management.vi.md) để biết role mapping, TTL, revoke và audit.
+Lệnh local không thể in token. Management console mTLS chỉ dùng Start, Reset và Stop: Start/Reset tự provision users/books/marker/registry, Start khởi động lab duy nhất, còn Stop thu hồi credential active rồi dừng service. Khi lab `RUNNING`, operator chủ động hiện/sao chép từng token đã provision rồi chuyển qua kênh được phê duyệt. Response bearer là `no-store`; token không nằm trong URL, audit/Operation hay browser storage bền vững. Xem [Management API](bola-lab-management.vi.md) để biết role mapping, TTL và audit.
 
 ## Khởi động service độc lập
 

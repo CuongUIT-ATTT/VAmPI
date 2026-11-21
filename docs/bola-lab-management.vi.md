@@ -12,7 +12,9 @@ CA trust **không đủ** để cấp quyền Token kiểm thử: chỉ principa
 
 ## Token kiểm thử
 
-Sau `init → validate → start`, operator mở `GET /management/console`, vào **Token kiểm thử**, chọn TTL 300–86.400 giây và cấp credential cho đúng ba principal:
+Console chỉ có ba lifecycle action: **Start, Reset, Stop**. Start đầu tiên tự tạo và validate private run (users, books, ownership/share, markers, manifest, answer sheet và credential registry), rồi khởi động duy nhất một lab. Reset chỉ chạy từ `STOPPED`: nó thay run bằng state mới đã validate và để lab ở `READY`; operator bấm Start để chạy replacement. Stop bị chặn khi còn evaluation lease chưa release và thu hồi credential active trước khi dừng service.
+
+Mỗi Start đầu tiên hoặc Reset tự provision credential metadata cho đúng ba principal; raw bearer chỉ được ký khi operator chủ động **Hiện** hoặc **Sao chép** lúc lab đang `RUNNING`:
 
 | Principal | Role |
 | --- | --- |
@@ -27,14 +29,11 @@ Management API chỉ có trong mTLS control plane:
 | Route | Quyền | Mục đích |
 | --- | --- | --- |
 | `GET /credentials` | operator | Metadata redacted của ba credential. |
-| `POST /credentials/issue` | operator | Cấp initial batch với `token_ttl_seconds`. Response bearer là `no-store`. |
-| `POST /credentials/{subject}/reissue` | operator | Cấp lại sau `EXPIRED`/`REVOKED`; response xác nhận token cũ đã vô hiệu. |
-| `POST /credentials/revoke-all` | operator | Thu hồi ngay mọi token active. |
 | `POST /credentials/{subject}/reveal` | operator | Hiện tạm một token active và ghi audit không chứa value. |
 | `POST /credentials/{subject}/copy-audit` | operator | Ghi việc operator yêu cầu copy, không mang credential. |
 | `GET /credentials/audit` | operator | Lịch sử actor/action/account/time/result redacted. |
 
-Mọi issue/reissue/revoke cần `Idempotency-Key` và `If-Match`. Issue/reissue bị chặn khi lifecycle `UNKNOWN`; `revoke-all` vẫn được chấp nhận vì chỉ giảm quyền. Reissue không âm thầm thay token active: chỉ credential đã hết hạn hoặc bị thu hồi mới đủ điều kiện. Reset tạo signing secret/registry mới nên tất cả token cũ bị từ chối sau request kế tiếp.
+Mọi Start/Reset/Stop cần `Idempotency-Key` và `If-Match`. `UNKNOWN` chặn mọi transition và credential reveal/copy cho đến khi đối soát ngoài băng. Stop thu hồi credential active; Reset tạo signing secret/registry mới nên tất cả token cũ bị từ chối sau request kế tiếp.
 
 Credential registry nằm trong private `lab.sqlite3`; không lưu serialized bearer. Token v2 mang `sub`, `role`, `jti`, `exp`, ký HMAC bằng signing secret private. Public GET service kiểm signature/expiry **và** lookup registry ở mỗi request. Token revoked, expired, malformed hoặc từ run cũ luôn nhận neutral `401 {"error":"unauthorized"}` mà không restart service.
 
@@ -46,6 +45,6 @@ Mọi response management (kể cả token-bearing response) có `Cache-Control:
 
 ## Lifecycle và vận hành
 
-`init`, `validate`, `start`, `stop`, `reset` giữ nguyên interlock lifecycle/lease. Không có token artifact `issued-tokens.json` hoặc local `show-token` command nữa. Controller chỉ seed data/private manifest; credential do operator mTLS issue sau khi lab chạy. Public API vẫn GET-only và OpenAPI public không chứa credential, registry, management, reset hoặc private state route.
+Start, Reset và Stop giữ interlock lifecycle/lease. Không có token artifact `issued-tokens.json`, manual issue/reissue/revoke endpoint hoặc local `show-token` command. Controller seed private data/manifest; lifecycle tự provision registry claims, còn operator mTLS chỉ reveal/copy raw bearer cho lab đang chạy. Public API vẫn GET-only và OpenAPI public không chứa credential, registry, management, reset hoặc private state route.
 
-Luồng operator: **Khởi tạo → Validate → Start → mở Token kiểm thử → cấp/hiện/sao chép theo role qua protected channel → chạy kiểm thử → Thu hồi toàn bộ → Stop**. Khi real deployment được nghiệm thu phải kiểm mTLS negative cases, proxy stripping, access logs không ghi `Authorization`/management response body, no-store, firewall/LAN/NAT/IPv6 và token revoked từ Machine A bị từ chối.
+Luồng operator: **Start → mở Token kiểm thử → hiện/sao chép theo role qua protected channel → chạy kiểm thử → Stop → Reset khi cần run mới → Start**. Khi real deployment được nghiệm thu phải kiểm mTLS negative cases, proxy stripping, access logs không ghi `Authorization`/management response body, no-store, firewall/LAN/NAT/IPv6 và token revoked từ Machine A bị từ chối.
