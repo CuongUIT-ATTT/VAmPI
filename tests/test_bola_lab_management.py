@@ -215,12 +215,16 @@ class BolaLabManagementTests(unittest.TestCase):
         token = self.console_token(self.operator)
         allowed = self.request("POST", "/management/v1/start", self.operator, body={"scenario": "S01", "token_ttl_seconds": 3600}, headers=self.console_headers(self.operator, token) | self.mutation_headers())
         self.assertEqual(allowed.status_code, 202)
-        missing_fetch_metadata = self.console_headers(self.operator, self.console_token(self.operator)) | self.mutation_headers("1", "metadata-missing")
-        for header in ("Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest"):
-            del missing_fetch_metadata[header]
-        webview = self.request("POST", "/management/v1/stop", self.operator, body={}, headers=missing_fetch_metadata)
+        webview_headers = self.console_headers(self.operator, self.console_token(self.operator)) | self.mutation_headers("1", "webview-metadata-missing")
+        for header in ("Origin", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest"):
+            del webview_headers[header]
+        webview = self.request("POST", "/management/v1/stop", self.operator, body={}, headers=webview_headers)
         self.assertEqual(webview.status_code, 202)
-        bad = self.request("POST", "/management/v1/start", self.operator, body={}, headers=self.console_headers(self.operator, "0.nonce.***") | self.mutation_headers("2", "b" * 16))
+        wrong_origin = self.console_headers(self.operator, self.console_token(self.operator)) | self.mutation_headers("2", "wrong-origin")
+        wrong_origin["Origin"] = "https://untrusted.example.test"
+        bad_origin = self.request("POST", "/management/v1/start", self.operator, body={}, headers=wrong_origin)
+        self.assertEqual(bad_origin.status_code, 403)
+        bad = self.request("POST", "/management/v1/start", self.operator, body={}, headers=self.console_headers(self.operator, "0.nonce.***") | self.mutation_headers("3", "b" * 16))
         self.assertEqual(bad.status_code, 403)
         console = self.request("GET", "/management/console", self.reader)
         self.assertEqual(console.headers["Cache-Control"], "no-store, max-age=0")
