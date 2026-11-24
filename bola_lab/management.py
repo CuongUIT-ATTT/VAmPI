@@ -166,11 +166,21 @@ def create_management_app(
         return request.headers.get("X-Management-Console") == "1" and request.method in {"POST", "DELETE"}
 
     def console_request_is_valid() -> bool:
+        """Require origin and CSRF; validate Fetch Metadata only when supplied.
+
+        Some embedded WebViews omit one or more Sec-Fetch-* headers for an
+        otherwise same-origin fetch. Origin plus the identity-bound CSRF HMAC
+        remain mandatory, while supplied Fetch Metadata must still describe a
+        same-origin XHR/fetch request.
+        """
+        fetch_site = request.headers.get("Sec-Fetch-Site")
+        fetch_mode = request.headers.get("Sec-Fetch-Mode")
+        fetch_dest = request.headers.get("Sec-Fetch-Dest")
         return (
             request.headers.get("Origin") == console_config.origin
-            and request.headers.get("Sec-Fetch-Site") == "same-origin"
-            and request.headers.get("Sec-Fetch-Mode") == "cors"
-            and request.headers.get("Sec-Fetch-Dest") == "empty"
+            and (fetch_site is None or fetch_site == "same-origin")
+            and (fetch_mode is None or fetch_mode in {"cors", "same-origin"})
+            and (fetch_dest is None or fetch_dest == "empty")
             and _valid_console_csrf_token(console_config, g.management_identity, request.headers.get("X-CSRF-Token"))
         )
 

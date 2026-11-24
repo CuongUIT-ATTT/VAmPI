@@ -215,7 +215,12 @@ class BolaLabManagementTests(unittest.TestCase):
         token = self.console_token(self.operator)
         allowed = self.request("POST", "/management/v1/start", self.operator, body={"scenario": "S01", "token_ttl_seconds": 3600}, headers=self.console_headers(self.operator, token) | self.mutation_headers())
         self.assertEqual(allowed.status_code, 202)
-        bad = self.request("POST", "/management/v1/start", self.operator, body={}, headers=self.console_headers(self.operator, "0.nonce.***") | self.mutation_headers("1", "b" * 16))
+        missing_fetch_metadata = self.console_headers(self.operator, self.console_token(self.operator)) | self.mutation_headers("1", "metadata-missing")
+        for header in ("Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest"):
+            del missing_fetch_metadata[header]
+        webview = self.request("POST", "/management/v1/stop", self.operator, body={}, headers=missing_fetch_metadata)
+        self.assertEqual(webview.status_code, 202)
+        bad = self.request("POST", "/management/v1/start", self.operator, body={}, headers=self.console_headers(self.operator, "0.nonce.***") | self.mutation_headers("2", "b" * 16))
         self.assertEqual(bad.status_code, 403)
         console = self.request("GET", "/management/console", self.reader)
         self.assertEqual(console.headers["Cache-Control"], "no-store, max-age=0")
